@@ -1,0 +1,9 @@
+{
+  "buildCommand": "cp artifacts/datamatrix-scanner/package.standalone.json artifacts/datamatrix-scanner/package.json && cd artifacts/datamatrix-scanner && npm install && npm run build",
+  "outputDirectory": "artifacts/datamatrix-scanner/dist",
+  "installCommand": "echo skip",
+  "framework": null,
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
