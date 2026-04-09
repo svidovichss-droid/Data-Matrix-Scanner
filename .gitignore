@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# GitHub Actions (requires special token scope — add manually via GitHub UI)
+.github/workflows/
