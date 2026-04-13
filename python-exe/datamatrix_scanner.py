@@ -310,14 +310,13 @@ class App(tk.Tk):
                             command=lambda k=key: self._switch_tab(k))
             btn.pack(side="left", fill="x", expand=True)
             self._tabs[key] = btn
-        self._switch_tab("result")
 
         self.tab_frame = tk.Frame(right, bg=BG)
         self.tab_frame.pack(fill="both", expand=True)
 
         self._build_result_tab()
         self._build_history_tab()
-        self._show_tab("result")
+        self._switch_tab("result")
 
         # статус-бар
         bar = tk.Frame(self, bg=BG2, height=24)
