@@ -1,0 +1,57 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'python-exe/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: python-exe
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Find pylibdmtx path
+        id: dmtx
+        working-directory: python-exe
+        run: |
+          $path = python -c "import pylibdmtx, os; print(os.path.dirname(pylibdmtx.__file__))"
+          echo "DMTX_DIR=$path" >> $env:GITHUB_OUTPUT
+
+      - name: Build EXE
+        working-directory: python-exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "DataMatrixScanner" `
+            --add-binary "${{ steps.dmtx.outputs.DMTX_DIR }}/libdmtx-64.dll;pylibdmtx" `
+            --hidden-import pylibdmtx `
+            --hidden-import pylibdmtx.pylibdmtx `
+            --hidden-import cv2 `
+            --hidden-import PIL `
+            --hidden-import PIL._tkinter_finder `
+            --collect-all pylibdmtx `
+            --collect-all cv2 `
+            datamatrix_scanner.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataMatrixScanner-Windows
+          path: python-exe/dist/DataMatrixScanner.exe
+          retention-days: 30
