@@ -36,9 +36,17 @@ export default function Scanner() {
     BrowserDatamatrixCodeReader.listVideoInputDevices().then((devices) => {
       setCameras(devices);
       if (devices.length > 0) {
-        setSelectedCamera(devices[devices.length - 1].deviceId);
+        // Выбираем первую камеру (обычно это основная камера)
+        // Или пытаемся найти камеру с "back" или "rear" в названии для мобильных
+        const backCamera = devices.find(d => 
+          d.label.toLowerCase().includes('back') || 
+          d.label.toLowerCase().includes('rear') ||
+          d.label.toLowerCase().includes('environment')
+        );
+        setSelectedCamera(backCamera ? backCamera.deviceId : devices[0].deviceId);
       }
-    }).catch(() => {
+    }).catch((err) => {
+      console.error('Ошибка получения списка камер:', err);
       setCameraError('Не удалось получить список камер. Разрешите доступ к камере в браузере.');
     });
   }, []);
@@ -102,17 +110,58 @@ export default function Scanner() {
       });
       readerRef.current = reader;
 
-      const constraints: MediaTrackConstraints = {
-        deviceId: { exact: selectedCamera },
-        width: { ideal: 1920, min: 1280 },
-        height: { ideal: 1080, min: 720 },
-        frameRate: { ideal: 60, min: 30 },
-        focusMode: 'continuous' as any,
-      };
+      // Пробуем разные подходы для получения доступа к камере
+      let stream: MediaStream | null = null;
+      
+      // Сначала пробуем с точными параметрами
+      try {
+        const constraints: MediaTrackConstraints = {
+          deviceId: { exact: selectedCamera },
+          width: { ideal: 1920, min: 1280 },
+          height: { ideal: 1080, min: 720 },
+          frameRate: { ideal: 60, min: 30 },
+          focusMode: 'continuous' as any,
+        };
 
-      const controls = await reader.decodeFromConstraints(
-        { video: constraints },
-        videoRef.current!,
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: constraints,
+          audio: false,
+        });
+      } catch (e: any) {
+        console.warn('Не удалось получить камеру с точными параметрами, пробуем упрощенные:', e);
+        
+        // Если не получилось, пробуем с более простыми параметрами
+        try {
+          const simpleConstraints: MediaTrackConstraints = {
+            deviceId: { exact: selectedCamera },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          };
+
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: simpleConstraints,
+            audio: false,
+          });
+        } catch (e2: any) {
+          console.warn('Не удалось получить камеру с упрощенными параметрами, пробуем базовые:', e2);
+          
+          // Последний вариант - просто запрашиваем камеру без спецификации
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: selectedCamera },
+            audio: false,
+          });
+        }
+      }
+
+      // Применяем поток к видео элементу
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      // Запускаем декодирование
+      const controls = await reader.decodeFromMediaStream(
+        stream,
         (result, error) => {
           if (result) {
             handleDecoded(result.getText());
@@ -123,6 +172,7 @@ export default function Scanner() {
       controlsRef.current = controls;
       setScanning(true);
     } catch (e: any) {
+      console.error('Ошибка запуска камеры:', e);
       setCameraError(`Ошибка запуска камеры: ${e?.message || e}`);
       setScanning(false);
     }
@@ -133,12 +183,27 @@ export default function Scanner() {
       controlsRef.current.stop();
       controlsRef.current = null;
     }
+    // Останавливаем все треки видеопотока
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
     setScanning(false);
   }, []);
 
   useEffect(() => {
     return () => {
-      controlsRef.current?.stop();
+      if (controlsRef.current) {
+        controlsRef.current.stop();
+        controlsRef.current = null;
+      }
+      // Останавливаем все треки видеопотока при размонтировании
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
     };
   }, []);
 
