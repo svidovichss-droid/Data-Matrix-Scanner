@@ -127,3 +127,13 @@ monitoring:
   enabled: true
   metrics_interval_sec: 5
   log_performance: true
+
+# History tracking configuration
+history:
+  # SQLite database path for storing history
+  database: datamatrix_history.db
+  # Maximum entries to keep in database
+  max_entries: 10000
+  # Enable automatic export on shutdown
+  auto_export: false
+  export_format: json  # json or csv
