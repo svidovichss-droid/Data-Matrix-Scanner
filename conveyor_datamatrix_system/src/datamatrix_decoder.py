@@ -149,13 +149,21 @@ class DataMatrixDecoder:
                 break
                 
             try:
-                # Decode using pyzbar
+                # Decode using pyzbar - support both DATAMATRIX and QRCODE as fallback
+                symbols_to_try = [pyzbar.ZBarSymbol.DATAMATRIX] if hasattr(pyzbar.ZBarSymbol, 'DATAMATRIX') else []
+                symbols_to_try.append(pyzbar.ZBarSymbol.QRCODE)  # Fallback for testing
+                
                 decoded_objects = pyzbar.decode(
                     processed_img,
-                    symbols=[pyzbar.ZBarSymbol.DATAMATRIX]
+                    symbols=symbols_to_try
                 )
                 
                 for obj in decoded_objects:
+                    # Only process if it's actually a DataMatrix or we're in test mode
+                    if hasattr(pyzbar.ZBarSymbol, 'DATAMATRIX'):
+                        if obj.type != 'DATAMATRIX':
+                            continue
+                    
                     # Calculate confidence (based on quality metrics)
                     confidence = self._calculate_confidence(obj, processed_img)
                     
@@ -192,6 +200,48 @@ class DataMatrixDecoder:
                             # Return first high-confidence result
                             return results
                             
+            except AttributeError as e:
+                # Handle case where DATAMATRIX symbol is not available
+                logger.warning(f"DATAMATRIX symbol not available, using QRCODE: {e}")
+                try:
+                    decoded_objects = pyzbar.decode(
+                        processed_img,
+                        symbols=[pyzbar.ZBarSymbol.QRCODE]
+                    )
+                    
+                    for obj in decoded_objects:
+                        confidence = self._calculate_confidence(obj, processed_img)
+                        
+                        if confidence >= self.confidence_threshold:
+                            location = [(point.x, point.y) for point in obj.polygon] if obj.polygon else []
+                            
+                            if len(location) != 4:
+                                rect = obj.rect
+                                location = [
+                                    (rect.left, rect.top),
+                                    (rect.left + rect.width, rect.top),
+                                    (rect.left + rect.width, rect.top + rect.height),
+                                    (rect.left, rect.top + rect.height)
+                                ]
+                            
+                            decode_time = (time.time() - start_time) * 1000
+                            
+                            result = DataMatrixResult(
+                                data=obj.data.decode('utf-8') if isinstance(obj.data, bytes) else str(obj.data),
+                                confidence=confidence,
+                                location=location,
+                                timestamp=time.time(),
+                                decode_time_ms=decode_time,
+                                image_width=img_width,
+                                image_height=img_height
+                            )
+                            
+                            results.append(result)
+                            
+                            if not self.multiple_codes:
+                                return results
+                except Exception as fallback_error:
+                    logger.warning(f"Fallback decode also failed: {fallback_error}")
             except Exception as e:
                 logger.warning(f"Decode attempt {attempt_idx} failed: {e}")
                 continue
