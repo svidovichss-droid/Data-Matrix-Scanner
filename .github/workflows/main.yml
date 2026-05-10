@@ -1,0 +1,70 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'python-exe/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: python-exe
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Find pylibdmtx directory and DLL
+        id: dmtx
+        working-directory: python-exe
+        shell: python
+        run: |
+          import pylibdmtx, os, glob
+          dmtx_dir = os.path.dirname(pylibdmtx.__file__)
+          print(f"pylibdmtx dir: {dmtx_dir}")
+          dlls = glob.glob(os.path.join(dmtx_dir, "libdmtx*.dll"))
+          print(f"DLLs found: {dlls}")
+          dll_arg = ""
+          if dlls:
+              dll = dlls[0]
+              dll_name = os.path.basename(dll)
+              dll_arg = f"--add-binary {dll};pylibdmtx"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"DMTX_DIR={dmtx_dir}\n")
+              f.write(f"DLL_ARG={dll_arg}\n")
+
+      - name: Build EXE
+        working-directory: python-exe
+        shell: cmd
+        run: |
+          pyinstaller ^
+            --onefile ^
+            --windowed ^
+            --name "DataMatrixScanner" ^
+            ${{ steps.dmtx.outputs.DLL_ARG }} ^
+            --hidden-import pylibdmtx ^
+            --hidden-import pylibdmtx.pylibdmtx ^
+            --hidden-import cv2 ^
+            --hidden-import PIL ^
+            --hidden-import PIL._tkinter_finder ^
+            --collect-all pylibdmtx ^
+            --collect-all cv2 ^
+            datamatrix_scanner.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataMatrixScanner-Windows
+          path: python-exe/dist/DataMatrixScanner.exe
+          retention-days: 30

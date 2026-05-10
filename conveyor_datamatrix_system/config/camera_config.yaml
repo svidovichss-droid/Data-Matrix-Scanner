@@ -1,0 +1,129 @@
+# Camera Configuration for Industrial DataMatrix System
+
+camera:
+  # Camera type: 'usb', 'gige', 'basler', 'flir', 'test'
+  type: test
+  
+  # Camera identifier (device index, IP address, or serial number)
+  id: 0
+  
+  # Image acquisition settings
+  settings:
+    width: 2448
+    height: 2048
+    pixel_format: Mono8
+    exposure_time: 5000  # microseconds
+    gain: 10.0  # dB
+    fps: 30
+    
+  # Trigger configuration
+  trigger:
+    enabled: true
+    mode: hardware  # hardware, software, continuous
+    polarity: rising_edge  # rising_edge, falling_edge
+    debounce_ms: 5
+    
+  # Region of Interest (optional, reduces processing time)
+  roi:
+    enabled: false
+    x: 0
+    y: 0
+    width: 2448
+    height: 2048
+    
+  # Network settings (for GigE cameras)
+  network:
+    mtu: 1500
+    packet_delay: 0
+    timeout: 1000
+
+# Processing pipeline
+processing:
+  # Number of worker threads
+  num_workers: 4
+  
+  # Buffer size (number of images to queue)
+  buffer_size: 10
+  
+  # Preprocessing options
+  preprocessing:
+    # Auto-contrast enhancement
+    contrast_enhancement: true
+    
+    # Noise reduction
+    denoise: true
+    denoise_strength: 5
+    
+    # Sharpening
+    sharpen: false
+    
+    # Binarization method: adaptive, otsu, fixed
+    binarization: adaptive
+    binarization_block_size: 11
+    binarization_c_value: 2
+    
+  # Detection parameters
+  detection:
+    # Minimum code size (pixels)
+    min_size: 20
+    
+    # Maximum code size (pixels)
+    max_size: 500
+    
+    # Search strategy: fast, accurate, balanced
+    strategy: balanced
+    
+  # Decoder settings
+  decoder:
+    # Decoder backend: zbar, zxing, opencv
+    backend: zbar
+    
+    # Enable multiple code detection
+    multiple_codes: true
+    
+    # Confidence threshold (0.0 - 1.0)
+    confidence_threshold: 0.7
+    
+    # Maximum decode attempts per image
+    max_attempts: 3
+
+# Output configuration
+output:
+  # Output format: console, json, mqtt, tcp, file
+  format: console
+  
+  # Include metadata
+  include_metadata: true
+  
+  # Timestamp format
+  timestamp_format: "%Y-%m-%d %H:%M:%S.%f"
+  
+  # File output settings (if format is 'file')
+  file:
+    path: ./results
+    filename_pattern: "datamatrix_{timestamp}.json"
+    
+  # MQTT settings (if format is 'mqtt')
+  mqtt:
+    broker: localhost
+    port: 1883
+    topic: conveyor/datamatrix
+    qos: 1
+    
+  # TCP settings (if format is 'tcp')
+  tcp:
+    host: localhost
+    port: 5000
+
+# Logging
+logging:
+  level: INFO
+  file: logs/system.log
+  max_size_mb: 10
+  backup_count: 5
+
+# Performance monitoring
+monitoring:
+  enabled: true
+  metrics_interval_sec: 5
+  log_performance: true
