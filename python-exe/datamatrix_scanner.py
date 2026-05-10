@@ -30,6 +30,99 @@ try:
 except Exception:
     DMTX_AVAILABLE = False
 
+
+# ── Детектор квадратов (fallback) ─────────────────────────────────────────────
+def find_square_roi(frame: np.ndarray):
+    """
+    Ищет квадратный/прямоугольный контур в кадре.
+    Возвращает (x, y, w, h) наибольшего квадратного региона или None.
+    """
+    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    candidates = []
+    for thresh_val in [None, 80, 120, 160]:
+        if thresh_val is None:
+            _, binary = cv2.threshold(blurred, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+
+        contours, _ = cv2.findContours(binary, cv2.RETR_LIST,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 1500:
+                continue
+            peri  = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+            if len(approx) != 4:
+                continue
+            x, y, w, h = cv2.boundingRect(approx)
+            aspect = max(w, h) / max(min(w, h), 1)
+            if aspect > 2.0:
+                continue
+            candidates.append((area, x, y, w, h))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    _, x, y, w, h = candidates[0]
+    pad = max(10, min(w, h) // 8)
+    fh, fw = frame.shape[:2]
+    x  = max(0, x - pad)
+    y  = max(0, y - pad)
+    w  = min(fw - x, w + pad * 2)
+    h  = min(fh - y, h + pad * 2)
+    return x, y, w, h
+
+
+# ── Попытка декодирования DataMatrix с предобработкой ────────────────────────
+def try_decode_dmtx(img_bgr: np.ndarray):
+    """
+    Пробует декодировать DataMatrix несколькими способами.
+    Возвращает строку или None.
+    """
+    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    h, w  = gray.shape
+
+    variants = []
+    # 1. Оригинал
+    variants.append(gray)
+    # 2. CLAHE
+    variants.append(enhanced)
+    # 3. Otsu по оригиналу
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(otsu)
+    # 4. Otsu по CLAHE
+    _, otsu_e = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(otsu_e)
+    # 5. Адаптивный порог
+    adapt = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    variants.append(adapt)
+
+    scales = [1.0, 1.5, 2.0, 0.75]
+
+    for scale in scales:
+        if scale == 1.0:
+            imgs = variants
+        else:
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            imgs = [cv2.resize(v, (nw, nh), interpolation=cv2.INTER_CUBIC)
+                    for v in variants]
+        for im in imgs:
+            try:
+                results = dmtx_decode(Image.fromarray(im),
+                                      timeout=200, max_count=1)
+                if results:
+                    return results[0].data.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+    return None
+
 # ── Тема ──────────────────────────────────────────────────────────────────────
 BG      = "#0f1117"
 BG2     = "#161b22"
@@ -563,43 +656,71 @@ class App(tk.Tk):
             except queue.Empty:
                 continue
 
-            # Минимальный интервал между попытками
             now = time.time()
             if now - self._last_decoded_t < self._decode_interval:
                 continue
 
-            h, w = frame.shape[:2]
-            m  = 0.15
-            x1 = int(w * m);      y1 = int(h * m)
-            x2 = int(w * (1-m));  y2 = int(h * (1-m))
-            roi = frame[y1:y2, x1:x2]
+            fh, fw = frame.shape[:2]
 
-            try:
-                decoded_list = dmtx_decode(
-                    Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)))
-            except Exception:
+            # ── Шаг 1: пробуем весь кадр ──────────────────────────────────
+            text = try_decode_dmtx(frame)
+            roi  = frame
+
+            # ── Шаг 2: пробуем центральную зону (70% кадра) ───────────────
+            if text is None:
+                m  = 0.15
+                x1 = int(fw * m);     y1 = int(fh * m)
+                x2 = int(fw*(1-m));   y2 = int(fh*(1-m))
+                center_roi = frame[y1:y2, x1:x2]
+                text = try_decode_dmtx(center_roi)
+                if text is not None:
+                    roi = center_roi
+
+            # ── Шаг 3: если DataMatrix не найден — ищем любой квадрат ─────
+            square_found = False
+            if text is None:
+                sq = find_square_roi(frame)
+                if sq is not None:
+                    sx, sy, sw, sh = sq
+                    sq_roi = frame[sy:sy+sh, sx:sx+sw]
+                    # Ещё одна попытка прочитать DataMatrix из найденного квадрата
+                    text = try_decode_dmtx(sq_roi)
+                    if text is not None:
+                        roi = sq_roi
+                    else:
+                        # Квадрат есть, но DataMatrix не читается → оценка F
+                        square_found = True
+                        roi = sq_roi
+
+            if text is None and not square_found:
                 continue
 
-            if not decoded_list:
+            # ── Повтор-фильтр ─────────────────────────────────────────────
+            label = text if text else "[нераспознан]"
+            if label == self._last_decoded and now - self._last_decoded_t < 2.0:
                 continue
 
-            text = decoded_list[0].data.decode("utf-8", errors="replace")
-            if text == self._last_decoded and now - self._last_decoded_t < 2.0:
-                continue
-
-            self._last_decoded   = text
+            self._last_decoded   = label
             self._last_decoded_t = now
 
-            t0  = time.perf_counter()
-            res = analyze_frame(roi)
-            ms  = (time.perf_counter() - t0) * 1000.0
+            # ── Анализ качества ───────────────────────────────────────────
+            t0 = time.perf_counter()
+            if square_found:
+                # Принудительная оценка F по всем параметрам
+                params = {key: {"value": 0.0, "grade": "F"}
+                          for key, _, _ in PARAMS_META}
+                res = {"params": params, "overall": "F", "score": 0.0}
+            else:
+                res = analyze_frame(roi)
+            ms = (time.perf_counter() - t0) * 1000.0
 
             if self.sound_on:
                 play_sound(res["overall"])
 
             # Передаём результат в главный поток
             try:
-                self.result_q.put_nowait({"text": text, "res": res, "ms": ms})
+                self.result_q.put_nowait({"text": label, "res": res, "ms": ms,
+                                          "decoded": text is not None})
             except queue.Full:
                 pass
 
@@ -644,20 +765,27 @@ class App(tk.Tk):
     def _poll_results(self):
         try:
             item = self.result_q.get_nowait()
-            self._update_result(item["text"], item["res"], item["ms"])
+            self._update_result(item["text"], item["res"], item["ms"],
+                                item.get("decoded", True))
             self._add_history(item["text"], item["res"])
         except queue.Empty:
             pass
         self.after(50, self._poll_results)
 
     # ── Обновление UI результатов ──────────────────────────────────────────────
-    def _update_result(self, text: str, res: dict, ms: float):
+    def _update_result(self, text: str, res: dict, ms: float, decoded: bool = True):
         grade = res["overall"]
         score = res["score"]
         color = GRADE_COLORS[grade]
 
         self.grade_lbl.config(text=grade, fg=color)
-        self.grade_name_lbl.config(text=GRADE_LABELS[grade], fg=color)
+
+        if decoded:
+            grade_label = GRADE_LABELS[grade]
+        else:
+            grade_label = "Квадрат найден, DataMatrix не читается"
+
+        self.grade_name_lbl.config(text=grade_label, fg=color)
         self.score_lbl.config(
             text=f"Итоговый балл: {score:.2f} / 4.0   (анализ: {ms:.0f} мс)")
         self.grade_bar_fg.place(relwidth=score / 4.0, relheight=1.0)
@@ -671,7 +799,7 @@ class App(tk.Tk):
             row["grade_box"].config(text=g, bg=c + "33", fg=c)
             row["bar"].config(bg=c)
             row["bar"].place(relwidth=v, relheight=1.0)
-            row["pct"].config(text=f"{v*100:.1f}%")
+            row["pct"].config(text=f"{v*100:.1f}%" if decoded else "  —  ")
 
         self.data_lbl.config(text=text)
         self.time_lbl.config(text=datetime.now().strftime("%H:%M:%S"))
