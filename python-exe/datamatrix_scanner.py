@@ -4,8 +4,6 @@ DataMatrix Quality Scanner
 Авторы: Александр Свидович, Алексей Петляков
 """
 
-import sys
-import os
 import threading
 import time
 import queue
@@ -30,99 +28,6 @@ try:
 except Exception:
     DMTX_AVAILABLE = False
 
-
-# ── Детектор квадратов (fallback) ─────────────────────────────────────────────
-def find_square_roi(frame: np.ndarray):
-    """
-    Ищет квадратный/прямоугольный контур в кадре.
-    Возвращает (x, y, w, h) наибольшего квадратного региона или None.
-    """
-    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    candidates = []
-    for thresh_val in [None, 80, 120, 160]:
-        if thresh_val is None:
-            _, binary = cv2.threshold(blurred, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        else:
-            _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-
-        contours, _ = cv2.findContours(binary, cv2.RETR_LIST,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 1500:
-                continue
-            peri  = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-            if len(approx) != 4:
-                continue
-            x, y, w, h = cv2.boundingRect(approx)
-            aspect = max(w, h) / max(min(w, h), 1)
-            if aspect > 2.0:
-                continue
-            candidates.append((area, x, y, w, h))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    _, x, y, w, h = candidates[0]
-    pad = max(10, min(w, h) // 8)
-    fh, fw = frame.shape[:2]
-    x  = max(0, x - pad)
-    y  = max(0, y - pad)
-    w  = min(fw - x, w + pad * 2)
-    h  = min(fh - y, h + pad * 2)
-    return x, y, w, h
-
-
-# ── Попытка декодирования DataMatrix с предобработкой ────────────────────────
-def try_decode_dmtx(img_bgr: np.ndarray):
-    """
-    Пробует декодировать DataMatrix несколькими способами.
-    Возвращает строку или None.
-    """
-    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    h, w  = gray.shape
-
-    variants = []
-    # 1. Оригинал
-    variants.append(gray)
-    # 2. CLAHE
-    variants.append(enhanced)
-    # 3. Otsu по оригиналу
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(otsu)
-    # 4. Otsu по CLAHE
-    _, otsu_e = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(otsu_e)
-    # 5. Адаптивный порог
-    adapt = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 11, 2)
-    variants.append(adapt)
-
-    scales = [1.0, 1.5, 2.0, 0.75]
-
-    for scale in scales:
-        if scale == 1.0:
-            imgs = variants
-        else:
-            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-            imgs = [cv2.resize(v, (nw, nh), interpolation=cv2.INTER_CUBIC)
-                    for v in variants]
-        for im in imgs:
-            try:
-                results = dmtx_decode(Image.fromarray(im),
-                                      timeout=200, max_count=1)
-                if results:
-                    return results[0].data.decode("utf-8", errors="replace")
-            except Exception:
-                pass
-    return None
-
 # ── Тема ──────────────────────────────────────────────────────────────────────
 BG      = "#0f1117"
 BG2     = "#161b22"
@@ -137,6 +42,14 @@ GRADE_COLORS = {
     "C": "#eab308",
     "D": "#f97316",
     "F": "#ef4444",
+}
+# Тёмные фоны для бейджей оценок (без alpha — tkinter не поддерживает 8-символьный HEX)
+GRADE_DIM = {
+    "A": "#0f2d1c",
+    "B": "#09211e",
+    "C": "#2e2406",
+    "D": "#2e1506",
+    "F": "#2e0a0a",
 }
 GRADE_LABELS = {
     "A": "Отлично",
@@ -193,8 +106,8 @@ def worst_grade(grades) -> str:
 
 
 def analyze_frame(frame: np.ndarray) -> dict:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    h, w = gray.shape
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w  = gray.shape
     total = h * w
 
     Rmax = float(gray.max())
@@ -202,15 +115,15 @@ def analyze_frame(frame: np.ndarray) -> dict:
     rng  = Rmax - Rmin if Rmax != Rmin else 1.0
     thr  = (Rmax + Rmin) / 2.0
 
-    sc = (Rmax - Rmin) / Rmax if Rmax > 0 else 0.0
+    sc   = (Rmax - Rmin) / Rmax if Rmax > 0 else 0.0
 
     dark  = gray[gray <  thr]
     light = gray[gray >= thr]
-    dm    = float(dark.mean())   if len(dark)  > 0 else 0.0
-    lm    = float(light.mean())  if len(light) > 0 else 255.0
-    ds    = float(dark.std())    if len(dark)  > 1 else 0.0
-    ls    = float(light.std())   if len(light) > 1 else 0.0
-    mod   = max(0.0, 1.0 - (ds + ls) / rng)
+    dm = float(dark.mean())  if len(dark)  > 0 else 0.0
+    lm = float(light.mean()) if len(light) > 0 else 255.0
+    ds = float(dark.std())   if len(dark)  > 1 else 0.0
+    ls = float(light.std())  if len(light) > 1 else 0.0
+    mod = max(0.0, 1.0 - (ds + ls) / rng)
 
     rm = min(
         (lm - thr) / max(lm - Rmin, 1),
@@ -221,7 +134,7 @@ def analyze_frame(frame: np.ndarray) -> dict:
     for row in range(min(4, h)):
         line = (gray[row] < thr).astype(np.uint8)
         edges += int(np.sum(np.abs(np.diff(line))))
-    fpd = min(1.0, edges / max((w + h), 1))
+    fpd = min(1.0, edges / max(w + h, 1))
 
     row_d = np.array([(gray[y] < thr).mean() for y in range(h)])
     col_d = np.array([(gray[:, x] < thr).mean() for x in range(w)])
@@ -239,12 +152,13 @@ def analyze_frame(frame: np.ndarray) -> dict:
     raw = {"SC": sc, "MOD": mod, "RM": rm, "FPD": fpd,
            "ANU": anu, "GNU": gnu, "UEC": uec, "PG": pg}
 
-    params = {k: {"value": max(0.0, min(1.0, float(v))),
-                  "grade": value_to_grade(max(0.0, min(1.0, float(v))), k)}
-              for k, v in raw.items()}
+    params = {}
+    for k, v in raw.items():
+        v = max(0.0, min(1.0, float(v)))
+        params[k] = {"value": v, "grade": value_to_grade(v, k)}
 
-    grades  = [p["grade"] for p in params.values()]
-    avg     = sum(grade_to_score(g) for g in grades) / len(grades)
+    grades = [p["grade"] for p in params.values()]
+    avg    = sum(grade_to_score(g) for g in grades) / len(grades)
     return {"params": params, "overall": worst_grade(grades), "score": avg}
 
 
@@ -252,7 +166,6 @@ def analyze_frame(frame: np.ndarray) -> dict:
 def play_sound(grade: str):
     if not WINSOUND_AVAILABLE:
         return
-
     def _play():
         try:
             if grade == "A":
@@ -269,8 +182,94 @@ def play_sound(grade: str):
                     winsound.Beep(380 if i % 2 == 0 else 220, 110); time.sleep(0.03)
         except Exception:
             pass
-
     threading.Thread(target=_play, daemon=True).start()
+
+
+# ── Предобработка и декодирование DataMatrix ──────────────────────────────────
+def try_decode_dmtx(img_bgr: np.ndarray):
+    """
+    Пробует прочитать DataMatrix несколькими вариантами предобработки.
+    Возвращает (text, rect_in_roi) или None.
+    rect_in_roi — (x, y, w, h) относительно img_bgr.
+    """
+    gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    h, w     = gray.shape
+
+    _, otsu  = cv2.threshold(gray,     0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu2 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adapt    = cv2.adaptiveThreshold(enhanced, 255,
+                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 11, 2)
+
+    variants = [gray, enhanced, otsu, otsu2, adapt]
+    scales   = [1.0, 1.5, 2.0, 0.75]
+
+    for scale in scales:
+        for im in variants:
+            if scale != 1.0:
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                im = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_CUBIC)
+            try:
+                results = dmtx_decode(Image.fromarray(im), timeout=200, max_count=1)
+                if results:
+                    r    = results[0]
+                    text = r.data.decode("utf-8", errors="replace")
+                    # Конвертируем rect обратно в масштаб оригинала
+                    rx = int(r.rect.left   / scale)
+                    ry = int(r.rect.top    / scale)
+                    rw = int(r.rect.width  / scale)
+                    rh = int(r.rect.height / scale)
+                    # pylibdmtx даёт y от нижнего края — переворачиваем
+                    ry = max(0, h - ry - rh)
+                    return text, (rx, ry, rw, rh)
+            except Exception:
+                pass
+    return None
+
+
+def find_square_roi(frame: np.ndarray):
+    """
+    Ищет квадратный контур как fallback-маркер.
+    Возвращает (x, y, w, h) или None.
+    """
+    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    fh, fw  = frame.shape[:2]
+
+    candidates = []
+    for t in [None, 80, 120, 160]:
+        if t is None:
+            _, binary = cv2.threshold(blurred, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, binary = cv2.threshold(blurred, t, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_LIST,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 1500:
+                continue
+            peri   = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+            if len(approx) != 4:
+                continue
+            x, y, bw, bh = cv2.boundingRect(approx)
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 2.0:
+                continue
+            candidates.append((area, x, y, bw, bh))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _, x, y, bw, bh = candidates[0]
+    pad = max(8, min(bw, bh) // 8)
+    x  = max(0, x - pad);        y  = max(0, y - pad)
+    bw = min(fw - x, bw + 2*pad); bh = min(fh - y, bh + 2*pad)
+    return x, y, bw, bh
 
 
 # ── Главное приложение ─────────────────────────────────────────────────────────
@@ -285,26 +284,24 @@ class App(tk.Tk):
         except Exception:
             self.geometry("1280x720")
 
-        # ── Состояние ────────────────────────────────────────────────────────
-        self.cap               = None
-        self.camera_id         = 0
-        self.running           = False
-        self.sound_on          = True
-        self.history           = []
-        self._last_decoded     = ""
-        self._last_decoded_t   = 0.0
-        self._decode_interval  = 0.25     # минимальный интервал между попытками декодирования
+        # Состояние
+        self.cap             = None
+        self.camera_id       = 0
+        self.running         = False
+        self.sound_on        = True
+        self.history         = []
+        self._last_decoded   = ""
+        self._last_decoded_t = 0.0
+        self._decode_interval = 0.3      # сек между попытками декодирования
 
-        # Три независимые очереди:
-        #   display_q  — кадры для отображения (главный поток)
-        #   decode_q   — кадры для декодирования (фоновый поток)
-        #   result_q   — результаты декодирования (главный поток)
+        # Очереди (три независимых потока)
         self.display_q = queue.Queue(maxsize=1)
         self.decode_q  = queue.Queue(maxsize=1)
-        self.result_q  = queue.Queue(maxsize=4)
+        self.result_q  = queue.Queue(maxsize=8)
 
-        self._fps_count = 0
-        self._fps_t     = time.time()
+        # Визуализация захвата: {box:(x,y,w,h), t:float, color:(B,G,R), ok:bool}
+        self._overlay      = None
+        self._overlay_lock = threading.Lock()
 
         self._setup_fonts()
         self._setup_styles()
@@ -346,6 +343,7 @@ class App(tk.Tk):
 
     # ── Интерфейс ─────────────────────────────────────────────────────────────
     def _build_ui(self):
+        # Заголовок
         hdr = tk.Frame(self, bg=BG2, height=46)
         hdr.pack(fill="x", side="top")
         hdr.pack_propagate(False)
@@ -354,22 +352,19 @@ class App(tk.Tk):
                  bg=BG2, fg=PRIMARY, font=self.fn_title).pack(side="left", padx=16, pady=10)
         tk.Label(hdr, text="ГОСТ Р 57302-2016 / ISO/IEC 15415",
                  bg=BG2, fg=FG2, font=self.fn_small).pack(side="left", padx=2, pady=10)
-
         tk.Label(hdr, text="Авторы: А. Свидович · А. Петляков",
                  bg=BG2, fg=FG2, font=self.fn_small).pack(side="right", padx=16)
-
         self.snd_btn = tk.Button(hdr, text="🔊", bg=BG2, fg=PRIMARY,
                                  relief="flat", cursor="hand2",
                                  command=self._toggle_sound, font=self.fn_head)
         self.snd_btn.pack(side="right", padx=4)
-
         self.fps_lbl = tk.Label(hdr, text="", bg=BG2, fg=PRIMARY, font=self.fn_mono)
         self.fps_lbl.pack(side="right", padx=12)
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
 
-        # Левая: видео
+        # ── Левая колонка: видео ──────────────────────────────────────────────
         left = tk.Frame(body, bg="black", width=680)
         left.pack(side="left", fill="both", expand=True)
         left.pack_propagate(False)
@@ -397,7 +392,7 @@ class App(tk.Tk):
                                    bg=BG2, fg=FG2, font=self.fn_small)
         self.status_lbl.pack(side="left", padx=8)
 
-        # Правая: результаты
+        # ── Правая колонка: результаты ────────────────────────────────────────
         right = tk.Frame(body, bg=BG, width=420)
         right.pack(side="right", fill="both")
         right.pack_propagate(False)
@@ -445,7 +440,6 @@ class App(tk.Tk):
         self.score_lbl = tk.Label(ginfo, text="Поднесите DataMatrix к камере",
                                   bg=BG2, fg=FG2, font=self.fn_small)
         self.score_lbl.pack(anchor="w")
-
         self.grade_bar_bg = tk.Frame(ginfo, bg=BG3, height=8)
         self.grade_bar_bg.pack(fill="x", pady=(6, 0))
         self.grade_bar_fg = tk.Frame(self.grade_bar_bg, bg=FG2, height=8)
@@ -463,14 +457,13 @@ class App(tk.Tk):
             row = tk.Frame(params_card, bg=row_bg)
             row.pack(fill="x")
 
-            grade_box = tk.Label(row, text="—", bg="#2a2a2a", fg=FG2,
+            grade_box = tk.Label(row, text="—", bg=BG3, fg=FG2,
                                  font=self.fn_mono, width=3, padx=4, pady=3)
             grade_box.pack(side="left", padx=(8, 6), pady=2)
 
-            pct_lbl = tk.Label(row, text="  —%  ", bg=row_bg, fg=FG2,
+            pct_lbl = tk.Label(row, text="   —%", bg=row_bg, fg=FG2,
                                font=self.fn_mono, width=7, anchor="e")
             pct_lbl.pack(side="right", padx=6)
-
             tk.Label(row, text=ref, bg=row_bg, fg=FG2,
                      font=self.fn_small, width=7, anchor="e").pack(side="right")
 
@@ -478,7 +471,6 @@ class App(tk.Tk):
             info.pack(side="left", fill="x", expand=True)
             tk.Label(info, text=f"{key}  {name}", bg=row_bg, fg=FG,
                      font=self.fn_body, anchor="w").pack(fill="x")
-
             bar_bg = tk.Frame(info, bg=BG3, height=4)
             bar_bg.pack(fill="x", pady=(0, 3))
             bar_fill = tk.Frame(bar_bg, bg=FG2, height=4)
@@ -523,7 +515,7 @@ class App(tk.Tk):
         tk.Label(self.hist_inner, text="История пуста",
                  bg=BG, fg=FG2, font=self.fn_body).pack(pady=40)
 
-    # ── Вкладки ────────────────────────────────────────────────────────────────
+    # ── Вкладки ───────────────────────────────────────────────────────────────
     def _switch_tab(self, key: str):
         for k, btn in self._tab_btns.items():
             btn.config(bg=BG3 if k == key else BG2,
@@ -535,7 +527,7 @@ class App(tk.Tk):
         else:
             self.history_frame.pack(fill="both", expand=True)
 
-    # ── Камера ─────────────────────────────────────────────────────────────────
+    # ── Камера ────────────────────────────────────────────────────────────────
     def _init_cameras(self):
         available = []
         for i in range(8):
@@ -548,7 +540,6 @@ class App(tk.Tk):
                 cap.release()
             except Exception:
                 pass
-
         if available:
             self.cam_combo["values"] = [f"Камера {i}" for i in available]
             self.cam_combo.current(len(available) - 1)
@@ -600,6 +591,8 @@ class App(tk.Tk):
             threading.Thread(target=self._capture_loop, daemon=True).start()
             if DMTX_AVAILABLE:
                 threading.Thread(target=self._decode_loop, daemon=True).start()
+            else:
+                threading.Thread(target=self._square_only_loop, daemon=True).start()
         except Exception as e:
             self.status_lbl.config(text=f"Ошибка: {e}")
 
@@ -610,28 +603,26 @@ class App(tk.Tk):
             self.cap.release()
             self.cap = None
         self.video_lbl.config(image="")
+        with self._overlay_lock:
+            self._overlay = None
 
-    # ── Поток захвата ──────────────────────────────────────────────────────────
-    # Только читает кадры и раскладывает по очередям — никакой обработки
+    # ── Поток 1: захват кадров ────────────────────────────────────────────────
     def _capture_loop(self):
         fps_count = 0
         fps_t     = time.time()
-
         while self.running and self.cap:
             ret, frame = self.cap.read()
             if not ret:
                 time.sleep(0.005)
                 continue
-
             fps_count += 1
             now = time.time()
             if now - fps_t >= 1.0:
                 v = fps_count
                 self.after(0, lambda v=v: self.fps_lbl.config(text=f"{v} fps"))
                 fps_count = 0
-                fps_t     = now
-
-            # Очередь отображения: только самый свежий кадр
+                fps_t = now
+            # Дисплей: всегда свежий кадр
             try:
                 self.display_q.put_nowait(frame)
             except queue.Full:
@@ -640,15 +631,13 @@ class App(tk.Tk):
                     self.display_q.put_nowait(frame)
                 except Exception:
                     pass
-
-            # Очередь декодирования: кладём только если декодер не занят
+            # Декодирование: пропускаем если занято
             try:
                 self.decode_q.put_nowait(frame)
             except queue.Full:
-                pass   # декодер занят — пропускаем кадр, не ждём
+                pass
 
-    # ── Поток декодирования ────────────────────────────────────────────────────
-    # Полностью изолирован от UI; результат кладёт в result_q
+    # ── Поток 2: декодирование DataMatrix ────────────────────────────────────
     def _decode_loop(self):
         while self.running:
             try:
@@ -661,41 +650,46 @@ class App(tk.Tk):
                 continue
 
             fh, fw = frame.shape[:2]
+            text   = None
+            box_in_frame = None  # (x, y, w, h) в координатах полного кадра
 
-            # ── Шаг 1: пробуем весь кадр ──────────────────────────────────
-            text = try_decode_dmtx(frame)
-            roi  = frame
+            # Шаг 1 — весь кадр
+            result = try_decode_dmtx(frame)
+            if result:
+                text, rect = result
+                box_in_frame = rect
 
-            # ── Шаг 2: пробуем центральную зону (70% кадра) ───────────────
+            # Шаг 2 — центральная зона
             if text is None:
                 m  = 0.15
-                x1 = int(fw * m);     y1 = int(fh * m)
-                x2 = int(fw*(1-m));   y2 = int(fh*(1-m))
-                center_roi = frame[y1:y2, x1:x2]
-                text = try_decode_dmtx(center_roi)
-                if text is not None:
-                    roi = center_roi
+                ox = int(fw * m);      oy = int(fh * m)
+                ex = int(fw * (1-m));  ey = int(fh * (1-m))
+                roi = frame[oy:ey, ox:ex]
+                result = try_decode_dmtx(roi)
+                if result:
+                    text, rect = result
+                    box_in_frame = (ox + rect[0], oy + rect[1], rect[2], rect[3])
 
-            # ── Шаг 3: если DataMatrix не найден — ищем любой квадрат ─────
+            # Шаг 3 — fallback: поиск квадрата
             square_found = False
+            sq_box       = None
             if text is None:
                 sq = find_square_roi(frame)
                 if sq is not None:
                     sx, sy, sw, sh = sq
                     sq_roi = frame[sy:sy+sh, sx:sx+sw]
-                    # Ещё одна попытка прочитать DataMatrix из найденного квадрата
-                    text = try_decode_dmtx(sq_roi)
-                    if text is not None:
-                        roi = sq_roi
+                    result = try_decode_dmtx(sq_roi)
+                    if result:
+                        text, rect = result
+                        box_in_frame = (sx + rect[0], sy + rect[1], rect[2], rect[3])
                     else:
-                        # Квадрат есть, но DataMatrix не читается → оценка F
                         square_found = True
-                        roi = sq_roi
+                        sq_box = sq
+                        box_in_frame = sq
 
             if text is None and not square_found:
                 continue
 
-            # ── Повтор-фильтр ─────────────────────────────────────────────
             label = text if text else "[нераспознан]"
             if label == self._last_decoded and now - self._last_decoded_t < 2.0:
                 continue
@@ -703,65 +697,146 @@ class App(tk.Tk):
             self._last_decoded   = label
             self._last_decoded_t = now
 
-            # ── Анализ качества ───────────────────────────────────────────
+            # Запись оверлея для отображения
+            with self._overlay_lock:
+                self._overlay = {
+                    "box":   box_in_frame,
+                    "t":     time.time(),
+                    "ok":    not square_found,
+                    "grade": None,   # заполним после анализа
+                }
+
+            # Анализ качества
             t0 = time.perf_counter()
             if square_found:
-                # Принудительная оценка F по всем параметрам
-                params = {key: {"value": 0.0, "grade": "F"}
-                          for key, _, _ in PARAMS_META}
-                res = {"params": params, "overall": "F", "score": 0.0}
+                params  = {k: {"value": 0.0, "grade": "F"} for k, _, _ in PARAMS_META}
+                res     = {"params": params, "overall": "F", "score": 0.0}
             else:
-                res = analyze_frame(roi)
+                # ROI для анализа: по возможности точный прямоугольник из декодера
+                if box_in_frame:
+                    bx, by, bw, bh = box_in_frame
+                    bx = max(0, bx); by = max(0, by)
+                    bw = min(fw - bx, bw); bh = min(fh - by, bh)
+                    analysis_roi = frame[by:by+bh, bx:bx+bw] if bw > 4 and bh > 4 else frame
+                else:
+                    analysis_roi = frame
+                res = analyze_frame(analysis_roi)
             ms = (time.perf_counter() - t0) * 1000.0
+
+            # Обновляем цвет оверлея по оценке
+            with self._overlay_lock:
+                if self._overlay:
+                    self._overlay["grade"] = res["overall"]
 
             if self.sound_on:
                 play_sound(res["overall"])
 
-            # Передаём результат в главный поток
             try:
-                self.result_q.put_nowait({"text": label, "res": res, "ms": ms,
-                                          "decoded": text is not None})
+                self.result_q.put_nowait({
+                    "text":    label,
+                    "res":     res,
+                    "ms":      ms,
+                    "decoded": not square_found,
+                })
             except queue.Full:
                 pass
 
-    # ── Главный поток: отображение видео ──────────────────────────────────────
+    # ── Поток 2b: только квадраты (когда pylibdmtx недоступен) ──────────────
+    def _square_only_loop(self):
+        while self.running:
+            try:
+                frame = self.decode_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            now = time.time()
+            if now - self._last_decoded_t < self._decode_interval:
+                continue
+            sq = find_square_roi(frame)
+            if not sq:
+                continue
+            label = "[нераспознан]"
+            if label == self._last_decoded and now - self._last_decoded_t < 2.0:
+                continue
+            self._last_decoded   = label
+            self._last_decoded_t = now
+            with self._overlay_lock:
+                self._overlay = {"box": sq, "t": time.time(), "ok": False, "grade": "F"}
+            params = {k: {"value": 0.0, "grade": "F"} for k, _, _ in PARAMS_META}
+            res    = {"params": params, "overall": "F", "score": 0.0}
+            if self.sound_on:
+                play_sound("F")
+            try:
+                self.result_q.put_nowait({"text": label, "res": res, "ms": 0.0, "decoded": False})
+            except queue.Full:
+                pass
+
+    # ── Поток 3 (главный): отображение видео ─────────────────────────────────
     def _poll_display(self):
         try:
             frame = self.display_q.get_nowait()
             self._render_frame(frame)
         except queue.Empty:
             pass
-        self.after(16, self._poll_display)   # ~60 fps
+        self.after(16, self._poll_display)
 
     def _render_frame(self, frame: np.ndarray):
-        h, w = frame.shape[:2]
-        m  = 0.15
-        x1 = int(w * m);      y1 = int(h * m)
-        x2 = int(w * (1-m));  y2 = int(h * (1-m))
-        clr = (0, 180, 216)
-        c   = 28
-
+        fh, fw = frame.shape[:2]
         display = frame.copy()
-        for sx, sy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
-            cv2.line(display, (sx, sy), (sx + dx*c, sy), clr, 2)
-            cv2.line(display, (sx, sy), (sx, sy + dy*c), clr, 2)
-        cv2.line(display, (0, h//2), (w, h//2), clr, 1)
 
+        # Прицел (центральная зона)
+        m  = 0.15
+        x1 = int(fw * m);     y1 = int(fh * m)
+        x2 = int(fw * (1-m)); y2 = int(fh * (1-m))
+        aim_clr = (0, 180, 216)
+        c = 28
+        for sx, sy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+            cv2.line(display, (sx, sy), (sx + dx*c, sy), aim_clr, 2)
+            cv2.line(display, (sx, sy), (sx, sy + dy*c), aim_clr, 2)
+        cv2.line(display, (0, fh//2), (fw, fh//2), aim_clr, 1)
+
+        # Оверлей обнаруженного символа
+        with self._overlay_lock:
+            ov = self._overlay
+
+        if ov and (time.time() - ov["t"]) < 2.5:
+            bx, by, bw, bh = ov["box"]
+            grade  = ov.get("grade")
+            if ov["ok"] and grade and grade != "F":
+                box_clr = (34, 197, 94)    # зелёный — успешное считывание
+            elif ov["ok"]:
+                box_clr = (249, 115, 22)   # оранжевый — считан, но оценка D/F
+            else:
+                box_clr = (239, 68, 68)    # красный — квадрат, не DataMatrix
+
+            # Толстая рамка вокруг символа
+            cv2.rectangle(display, (bx, by), (bx+bw, by+bh), box_clr, 3)
+
+            # Уголки акцентные
+            cc = 20
+            for px, py, dx, dy in [(bx,by,1,1),(bx+bw,by,-1,1),(bx,by+bh,1,-1),(bx+bw,by+bh,-1,-1)]:
+                cv2.line(display, (px, py), (px + dx*cc, py), box_clr, 5)
+                cv2.line(display, (px, py), (px, py + dy*cc), box_clr, 5)
+
+            # Подпись оценки
+            if grade:
+                txt = grade if ov["ok"] else "?"
+                cv2.putText(display, txt,
+                            (bx + 6, by - 10 if by > 20 else by + bh + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, box_clr, 3, cv2.LINE_AA)
+
+        # Масштабирование под размер виджета
         cw = max(1, self.video_lbl.winfo_width())
         ch = max(1, self.video_lbl.winfo_height())
-        sc = min(cw / w, ch / h)
-        nw = max(1, int(w * sc))
-        nh = max(1, int(h * sc))
-
-        # Быстрое масштабирование для отображения
+        sc = min(cw / fw, ch / fh)
+        nw = max(1, int(fw * sc))
+        nh = max(1, int(fh * sc))
         small = cv2.resize(display, (nw, nh), interpolation=cv2.INTER_LINEAR)
         rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        img   = Image.fromarray(rgb)
-        imgtk = ImageTk.PhotoImage(image=img)
+        imgtk = ImageTk.PhotoImage(image=Image.fromarray(rgb))
         self.video_lbl.imgtk = imgtk
         self.video_lbl.config(image=imgtk)
 
-    # ── Главный поток: обновление результатов ─────────────────────────────────
+    # ── Главный поток: результаты ─────────────────────────────────────────────
     def _poll_results(self):
         try:
             item = self.result_q.get_nowait()
@@ -772,20 +847,15 @@ class App(tk.Tk):
             pass
         self.after(50, self._poll_results)
 
-    # ── Обновление UI результатов ──────────────────────────────────────────────
     def _update_result(self, text: str, res: dict, ms: float, decoded: bool = True):
         grade = res["overall"]
         score = res["score"]
         color = GRADE_COLORS[grade]
 
         self.grade_lbl.config(text=grade, fg=color)
-
-        if decoded:
-            grade_label = GRADE_LABELS[grade]
-        else:
-            grade_label = "Квадрат найден, DataMatrix не читается"
-
-        self.grade_name_lbl.config(text=grade_label, fg=color)
+        self.grade_name_lbl.config(
+            text=GRADE_LABELS[grade] if decoded else "Квадрат найден — DataMatrix не читается",
+            fg=color)
         self.score_lbl.config(
             text=f"Итоговый балл: {score:.2f} / 4.0   (анализ: {ms:.0f} мс)")
         self.grade_bar_fg.place(relwidth=score / 4.0, relheight=1.0)
@@ -796,10 +866,11 @@ class App(tk.Tk):
             g   = meta["grade"]
             v   = meta["value"]
             c   = GRADE_COLORS[g]
-            row["grade_box"].config(text=g, bg=c + "33", fg=c)
+            d   = GRADE_DIM[g]
+            row["grade_box"].config(text=g, bg=d, fg=c)
             row["bar"].config(bg=c)
             row["bar"].place(relwidth=v, relheight=1.0)
-            row["pct"].config(text=f"{v*100:.1f}%" if decoded else "  —  ")
+            row["pct"].config(text=f"{v*100:.1f}%" if decoded else "   —")
 
         self.data_lbl.config(text=text)
         self.time_lbl.config(text=datetime.now().strftime("%H:%M:%S"))
@@ -809,16 +880,18 @@ class App(tk.Tk):
         if len(self.history) > 50:
             self.history = self.history[:50]
 
-        for w in self.hist_inner.winfo_children():
-            w.destroy()
+        # Перестраиваем список (виджеты, не canvas-items)
+        for widget in self.hist_inner.winfo_children():
+            widget.destroy()
 
         for rec in self.history:
             grade = rec["res"]["overall"]
             color = GRADE_COLORS[grade]
+            dim   = GRADE_DIM[grade]
             row   = tk.Frame(self.hist_inner, bg=BG2)
             row.pack(fill="x", padx=4, pady=1)
 
-            tk.Label(row, text=grade, bg=color + "22", fg=color,
+            tk.Label(row, text=grade, bg=dim, fg=color,
                      font=self.fn_head, width=4, pady=6).pack(side="left")
             info = tk.Frame(row, bg=BG2)
             info.pack(side="left", fill="x", expand=True, padx=8)
