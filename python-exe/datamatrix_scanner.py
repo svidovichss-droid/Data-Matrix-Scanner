@@ -290,9 +290,10 @@ class App(tk.Tk):
         self.running         = False
         self.sound_on        = True
         self.history         = []
-        self._last_decoded   = ""
-        self._last_decoded_t = 0.0
-        self._decode_interval = 0.3      # сек между попытками декодирования
+        self._last_decoded    = ""
+        self._last_decoded_t  = 0.0
+        self._decode_interval = 0.15     # сек между попытками декодирования
+        self._scan_lock_ms    = 1500     # мс блокировки повтора одного и того же кода
 
         # Очереди (три независимых потока)
         self.display_q = queue.Queue(maxsize=1)
@@ -691,11 +692,13 @@ class App(tk.Tk):
                 continue
 
             label = text if text else "[нераспознан]"
-            if label == self._last_decoded and now - self._last_decoded_t < 2.0:
+            if label == self._last_decoded and now - self._last_decoded_t < (self._scan_lock_ms / 1000.0):
                 continue
 
             self._last_decoded   = label
             self._last_decoded_t = now
+            # Через scan_lock_ms сбрасываем блокировку — программа сразу ищет следующий код
+            self.after(self._scan_lock_ms, self._reset_scan_lock)
 
             # Запись оверлея для отображения
             with self._overlay_lock:
@@ -755,10 +758,11 @@ class App(tk.Tk):
             if not sq:
                 continue
             label = "[нераспознан]"
-            if label == self._last_decoded and now - self._last_decoded_t < 2.0:
+            if label == self._last_decoded and now - self._last_decoded_t < (self._scan_lock_ms / 1000.0):
                 continue
             self._last_decoded   = label
             self._last_decoded_t = now
+            self.after(self._scan_lock_ms, self._reset_scan_lock)
             with self._overlay_lock:
                 self._overlay = {"box": sq, "t": time.time(), "ok": False, "grade": "F"}
             params = {k: {"value": 0.0, "grade": "F"} for k, _, _ in PARAMS_META}
@@ -904,6 +908,11 @@ class App(tk.Tk):
         self._tab_btns["history"].config(text=f"История ({len(self.history)})")
 
     # ── Прочее ────────────────────────────────────────────────────────────────
+    def _reset_scan_lock(self):
+        """Сбрасывает блокировку повтора — программа готова найти следующий код."""
+        self._last_decoded   = ""
+        self._last_decoded_t = 0.0
+
     def _toggle_sound(self):
         self.sound_on = not self.sound_on
         self.snd_btn.config(
