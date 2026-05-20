@@ -21,11 +21,24 @@ export interface QualityResult {
   analysisTimeMs: number;
 }
 
-function scoreToGrade(score: number): Grade {
-  if (score >= 3.5) return 'A';
-  if (score >= 2.5) return 'B';
-  if (score >= 1.5) return 'C';
-  if (score >= 0.5) return 'D';
+// ── Оценки ISO/IEC 15415 Table 3 ─────────────────────────────────────────────
+const GRADE_THRESH: Record<string, [number, number, number, number]> = {
+  SC:  [0.70, 0.55, 0.40, 0.20],   // Symbol Contrast          §7.4
+  MOD: [0.60, 0.50, 0.40, 0.30],   // Modulation (min ERN)     §7.5
+  RM:  [0.30, 0.20, 0.10, 0.01],   // Reflectance Margin       §7.6
+  FPD: [0.90, 0.75, 0.55, 0.30],   // Fixed Pattern Damage     §7.7
+  ANU: [0.94, 0.92, 0.90, 0.88],   // Axial Non-Uniformity     §7.8
+  GNU: [0.94, 0.92, 0.90, 0.88],   // Grid Non-Uniformity      §7.9
+  UEC: [0.62, 0.50, 0.37, 0.25],   // Unused Error Correction  §7.10
+  PG:  [0.90, 0.75, 0.55, 0.30],   // Print Growth             §7.11
+};
+
+function metricToGrade(value: number, key: string): Grade {
+  const [a, b, c, d] = GRADE_THRESH[key];
+  if (value >= a) return 'A';
+  if (value >= b) return 'B';
+  if (value >= c) return 'C';
+  if (value >= d) return 'D';
   return 'F';
 }
 
@@ -33,11 +46,180 @@ function gradeToScore(g: Grade): number {
   return g === 'A' ? 4 : g === 'B' ? 3 : g === 'C' ? 2 : g === 'D' ? 1 : 0;
 }
 
-function getLowestGrade(grades: Grade[]): Grade {
+function worstGrade(grades: Grade[]): Grade {
   const scores = grades.map(gradeToScore);
-  const min = Math.min(...scores);
-  return scoreToGrade(min - 0.01);
+  const min    = Math.min(...scores);
+  // Преобразуем score обратно в оценку
+  if (min >= 4) return 'A';
+  if (min >= 3) return 'B';
+  if (min >= 2) return 'C';
+  if (min >= 1) return 'D';
+  return 'F';
 }
+
+// ── Вспомогательные функции ISO-анализа ──────────────────────────────────────
+
+/** Оценка шага модуля в пикселях по позициям переходов в бинарном профиле */
+function estimateModulePitch(profile: Uint8Array | number[], rdt: number): number {
+  const transitions: number[] = [];
+  for (let i = 1; i < profile.length; i++) {
+    const prev = profile[i - 1] < rdt;
+    const curr = profile[i]     < rdt;
+    if (prev !== curr) transitions.push(i);
+  }
+  if (transitions.length < 2) return Math.max(1, Math.floor(profile.length / 10));
+  const gaps: number[] = [];
+  for (let i = 1; i < transitions.length; i++) gaps.push(transitions[i] - transitions[i - 1]);
+  gaps.sort((a, b) => a - b);
+  return Math.max(1, gaps[Math.floor(gaps.length / 2)]);  // медиана
+}
+
+/** Значение яркости пикселя в бинарном (0/255) изображении */
+function bilinearSample(gray: Float32Array, w: number, h: number, cx: number, cy: number, r: number): number {
+  const x1 = Math.max(0, cx - r), x2 = Math.min(w - 1, cx + r);
+  const y1 = Math.max(0, cy - r), y2 = Math.min(h - 1, cy + r);
+  let sum = 0, cnt = 0;
+  for (let y = y1; y <= y2; y++) {
+    for (let x = x1; x <= x2; x++) {
+      sum += gray[y * w + x];
+      cnt++;
+    }
+  }
+  return cnt > 0 ? sum / cnt : 0;
+}
+
+// ── Полный анализ по ISO/IEC 15415 ───────────────────────────────────────────
+function analyzeDatamatrixISO(
+  gray: Float32Array,
+  w: number,
+  h: number
+): Record<string, number> | null {
+
+  // §7.4  SC — Symbol Contrast
+  let Rmax = 0, Rmin = 255;
+  for (let i = 0; i < gray.length; i++) {
+    if (gray[i] > Rmax) Rmax = gray[i];
+    if (gray[i] < Rmin) Rmin = gray[i];
+  }
+  if (Rmax < 1) return null;
+  const rng = Math.max(Rmax - Rmin, 0.001);
+  const RDT = (Rmax + Rmin) / 2;
+  const SC  = (Rmax - Rmin) / Rmax;
+
+  // Оценка шага по верхней строке (≈ тактовый рисунок) и среднему столбцу
+  const topRow: number[] = [];
+  const topY = Math.max(0, Math.floor(h / 8));
+  for (let x = 0; x < w; x++) topRow.push(gray[topY * w + x]);
+
+  const midCol: number[] = [];
+  const midX = Math.floor(w / 2);
+  for (let y = 0; y < h; y++) midCol.push(gray[y * w + midX]);
+
+  let px = estimateModulePitch(topRow, RDT);
+  let py = estimateModulePitch(midCol, RDT);
+  px = Math.max(1, Math.min(px, Math.floor(w / 2)));
+  py = Math.max(1, Math.min(py, Math.floor(h / 2)));
+
+  const nCols = Math.max(2, Math.floor(w / px));
+  const nRows = Math.max(2, Math.floor(h / py));
+  const r     = Math.max(1, Math.floor(Math.min(px, py) / 4));
+
+  // Выборка центров модулей
+  const dark:  number[] = [];
+  const light: number[] = [];
+  for (let row = 0; row < nRows; row++) {
+    for (let col = 0; col < nCols; col++) {
+      const cx = Math.floor((col + 0.5) * px);
+      const cy = Math.floor((row + 0.5) * py);
+      if (cx >= w || cy >= h) continue;
+      const val = bilinearSample(gray, w, h, cx, cy, r);
+      if (val < RDT) dark.push(val);
+      else           light.push(val);
+    }
+  }
+  if (dark.length === 0 || light.length === 0) return null;
+
+  // §7.5  MOD — min ERN по всем модулям
+  const darkDenom  = Math.max(RDT - Rmin, 0.001);
+  const lightDenom = Math.max(Rmax - RDT, 0.001);
+  const ernDark  = dark.map(v  => (RDT - v)  / darkDenom);
+  const ernLight = light.map(v => (v  - RDT) / lightDenom);
+  const MOD = Math.max(0, Math.min(1,
+    Math.min(Math.min(...ernDark), Math.min(...ernLight))
+  ));
+
+  // §7.6  RM — минимальный запас до RDT / rng
+  const darkMargin  = Math.min(...dark.map(v  => RDT - v))  / rng;
+  const lightMargin = Math.min(...light.map(v => v  - RDT)) / rng;
+  const RM = Math.max(0, Math.min(1, Math.min(darkMargin, lightMargin)));
+
+  // §7.7  FPD — Finder (левый + нижний) + Clock (верхний + правый)
+  let leftDark = 0;
+  for (let y = 0; y < h; y++) if (gray[y * w] < RDT) leftDark++;
+  const leftScore = leftDark / h;
+
+  let botDark = 0;
+  for (let x = 0; x < w; x++) if (gray[(h - 1) * w + x] < RDT) botDark++;
+  const botScore = botDark / w;
+
+  let topTrans = 0;
+  let prevTop = gray[0] < RDT;
+  for (let x = 1; x < w; x++) {
+    const cur = gray[x] < RDT;
+    if (cur !== prevTop) { topTrans++; prevTop = cur; }
+  }
+  const topClock = Math.min(1, (topTrans * 2) / Math.max(w - 1, 1));
+
+  let rightTrans = 0;
+  let prevRight = gray[w - 1] < RDT;
+  for (let y = 1; y < h; y++) {
+    const cur = gray[y * w + w - 1] < RDT;
+    if (cur !== prevRight) { rightTrans++; prevRight = cur; }
+  }
+  const rightClock = Math.min(1, (rightTrans * 2) / Math.max(h - 1, 1));
+  const FPD = Math.max(0, Math.min(1, (leftScore + botScore + topClock + rightClock) / 4));
+
+  // §7.8  ANU — |px − py| / avg_pitch
+  const avgPitch = (px + py) / 2;
+  const ANU = Math.max(0, 1 - Math.abs(px - py) / Math.max(avgPitch, 1));
+
+  // §7.9  GNU — отклонение переходов от идеальной сетки (95-й перцентиль / px)
+  const deviations: number[] = [];
+  for (let row = 0; row < nRows; row += Math.max(1, Math.floor(nRows / 6))) {
+    const cy = Math.floor((row + 0.5) * py);
+    if (cy >= h) continue;
+    const transitions: number[] = [];
+    let prev = gray[cy * w] < RDT;
+    for (let x = 1; x < w; x++) {
+      const cur = gray[cy * w + x] < RDT;
+      if (cur !== prev) { transitions.push(x); prev = cur; }
+    }
+    transitions.forEach((t, i) => {
+      const ideal = i * px + Math.floor(px / 2);
+      if (ideal < w) deviations.push(Math.abs(t - ideal));
+    });
+  }
+  let GNU = 0.5;
+  if (deviations.length > 0) {
+    const sorted = [...deviations].sort((a, b) => a - b);
+    const p95    = sorted[Math.floor(sorted.length * 0.95)];
+    GNU = Math.max(0, Math.min(1, 1 - p95 / Math.max(px, 1)));
+  }
+
+  // §7.10  UEC — аппроксимация (ECC200 недоступен из браузера)
+  const UEC = Math.min(1, SC * 0.5 + MOD * 0.5);
+
+  // §7.11  PG — разброс яркостей внутри классов
+  const darkMean  = dark.reduce((s, v)  => s + v, 0)  / dark.length;
+  const lightMean = light.reduce((s, v) => s + v, 0) / light.length;
+  const darkStd   = Math.sqrt(dark.reduce((s, v)  => s + (v - darkMean)  ** 2, 0) / dark.length);
+  const lightStd  = Math.sqrt(light.reduce((s, v) => s + (v - lightMean) ** 2, 0) / light.length);
+  const PG = Math.max(0, Math.min(1, 1 - (darkStd + lightStd) / rng));
+
+  return { SC, MOD, RM, FPD, ANU, GNU, UEC, PG };
+}
+
+// ── Публичный API ─────────────────────────────────────────────────────────────
 
 export interface ImageMetrics {
   symbolContrast: number;
@@ -50,150 +232,6 @@ export interface ImageMetrics {
   printGrowth: number;
 }
 
-function analyzeImageData(canvas: HTMLCanvasElement, roi?: { x: number; y: number; w: number; h: number }): ImageMetrics | null {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return null;
-
-  const x = roi?.x ?? 0;
-  const y = roi?.y ?? 0;
-  const w = roi?.w ?? canvas.width;
-  const h = roi?.h ?? canvas.height;
-
-  const imageData = ctx.getImageData(x, y, w, h);
-  const data = imageData.data;
-  const pixels = w * h;
-
-  if (pixels === 0) return null;
-
-  const grayValues: number[] = [];
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    grayValues.push(0.299 * r + 0.587 * g + 0.114 * b);
-  }
-
-  const maxGray = Math.max(...grayValues);
-  const minGray = Math.min(...grayValues);
-  const range = maxGray - minGray;
-
-  const Rmax = maxGray / 255;
-  const Rmin = minGray / 255;
-  const symbolContrast = (Rmax - Rmin) / Rmax;
-
-  const threshold = (maxGray + minGray) / 2;
-  const darkPixels = grayValues.filter(v => v < threshold);
-  const lightPixels = grayValues.filter(v => v >= threshold);
-
-  const darkMean = darkPixels.length > 0 ? darkPixels.reduce((a, b) => a + b, 0) / darkPixels.length : 0;
-  const lightMean = lightPixels.length > 0 ? lightPixels.reduce((a, b) => a + b, 0) / lightPixels.length : 255;
-
-  const darkVariance = darkPixels.length > 1
-    ? darkPixels.reduce((sum, v) => sum + Math.pow(v - darkMean, 2), 0) / (darkPixels.length - 1)
-    : 0;
-  const lightVariance = lightPixels.length > 1
-    ? lightPixels.reduce((sum, v) => sum + Math.pow(v - lightMean, 2), 0) / (lightPixels.length - 1)
-    : 0;
-
-  const modulation = range > 0 ? 1 - (Math.sqrt(darkVariance) + Math.sqrt(lightVariance)) / range : 0;
-
-  const reflectanceMargin = Math.min(
-    (lightMean - threshold) / (lightMean - minGray + 1),
-    (threshold - darkMean) / (maxGray - darkMean + 1)
-  );
-
-  const edgeCount = countEdges(grayValues, w, h, threshold);
-  const expectedEdges = (w + h) * 2;
-  const fixedPatternDamage = Math.min(1, edgeCount / (expectedEdges * 0.5));
-
-  const axialNonUniformity = computeAxialNonUniformity(grayValues, w, h, threshold);
-
-  const gridNonUniformity = computeGridNonUniformity(grayValues, w, h);
-
-  const printGrowth = computePrintGrowth(darkPixels.length, lightPixels.length, pixels);
-
-  const unusedErrorCorrection = Math.min(1, Math.max(0, symbolContrast * modulation));
-
-  return {
-    symbolContrast: Math.max(0, Math.min(1, symbolContrast)),
-    modulation: Math.max(0, Math.min(1, modulation)),
-    reflectanceMargin: Math.max(0, Math.min(1, reflectanceMargin)),
-    fixedPatternDamage: Math.max(0, Math.min(1, fixedPatternDamage)),
-    axialNonUniformity: Math.max(0, Math.min(1, 1 - axialNonUniformity)),
-    gridNonUniformity: Math.max(0, Math.min(1, 1 - gridNonUniformity)),
-    unusedErrorCorrection: Math.max(0, Math.min(1, unusedErrorCorrection)),
-    printGrowth: Math.max(0, Math.min(1, printGrowth)),
-  };
-}
-
-function countEdges(gray: number[], w: number, h: number, threshold: number): number {
-  let edges = 0;
-  for (let y = 0; y < Math.min(h, 4); y++) {
-    for (let x = 1; x < w; x++) {
-      const prev = gray[y * w + x - 1] < threshold;
-      const curr = gray[y * w + x] < threshold;
-      if (prev !== curr) edges++;
-    }
-  }
-  return edges;
-}
-
-function computeAxialNonUniformity(gray: number[], w: number, h: number, threshold: number): number {
-  const rowDark: number[] = [];
-  const colDark: number[] = [];
-  for (let y = 0; y < h; y++) {
-    let d = 0;
-    for (let x = 0; x < w; x++) if (gray[y * w + x] < threshold) d++;
-    rowDark.push(d / w);
-  }
-  for (let x = 0; x < w; x++) {
-    let d = 0;
-    for (let y = 0; y < h; y++) if (gray[y * w + x] < threshold) d++;
-    colDark.push(d / h);
-  }
-  const rowMean = rowDark.reduce((a, b) => a + b, 0) / rowDark.length;
-  const colMean = colDark.reduce((a, b) => a + b, 0) / colDark.length;
-  const rowVar = rowDark.reduce((sum, v) => sum + Math.pow(v - rowMean, 2), 0) / rowDark.length;
-  const colVar = colDark.reduce((sum, v) => sum + Math.pow(v - colMean, 2), 0) / colDark.length;
-  return Math.sqrt((rowVar + colVar) / 2);
-}
-
-function computeGridNonUniformity(gray: number[], w: number, h: number): number {
-  const blockSize = Math.max(4, Math.floor(Math.min(w, h) / 8));
-  const blockMeans: number[] = [];
-  for (let y = 0; y + blockSize <= h; y += blockSize) {
-    for (let x = 0; x + blockSize <= w; x += blockSize) {
-      let sum = 0;
-      for (let by = y; by < y + blockSize; by++) {
-        for (let bx = x; bx < x + blockSize; bx++) {
-          sum += gray[by * w + bx];
-        }
-      }
-      blockMeans.push(sum / (blockSize * blockSize));
-    }
-  }
-  if (blockMeans.length < 2) return 0;
-  const mean = blockMeans.reduce((a, b) => a + b, 0) / blockMeans.length;
-  const variance = blockMeans.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / blockMeans.length;
-  return Math.sqrt(variance) / 255;
-}
-
-function computePrintGrowth(darkCount: number, lightCount: number, total: number): number {
-  const darkRatio = darkCount / total;
-  const ideal = 0.5;
-  const deviation = Math.abs(darkRatio - ideal);
-  return 1 - Math.min(1, deviation * 4);
-}
-
-function metricToGrade(value: number, thresholds: [number, number, number, number]): Grade {
-  const [a, b, c, d] = thresholds;
-  if (value >= a) return 'A';
-  if (value >= b) return 'B';
-  if (value >= c) return 'C';
-  if (value >= d) return 'D';
-  return 'F';
-}
-
 export function analyzeQuality(
   canvas: HTMLCanvasElement,
   decodedData: string,
@@ -201,147 +239,122 @@ export function analyzeQuality(
 ): QualityResult {
   const start = performance.now();
 
-  const metrics = analyzeImageData(canvas, roi);
+  const ctx = canvas.getContext('2d');
+  let params: QualityParameter[];
 
-  let parameters: QualityParameter[] = [];
+  if (ctx) {
+    const x = roi?.x ?? 0,  y = roi?.y ?? 0;
+    const w = roi?.w ?? canvas.width, h = roi?.h ?? canvas.height;
+    const imageData = ctx.getImageData(x, y, w, h);
+    const data      = imageData.data;
 
-  if (metrics) {
-    parameters = [
-      {
-        name: 'SC',
-        nameRu: 'Контраст символа',
-        gostRef: 'п. 5.4',
-        value: metrics.symbolContrast,
-        grade: metricToGrade(metrics.symbolContrast, [0.70, 0.55, 0.40, 0.20]),
-        description: 'Разница между максимальным и минимальным отражением символа',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'MOD',
-        nameRu: 'Модуляция',
-        gostRef: 'п. 5.5',
-        value: metrics.modulation,
-        grade: metricToGrade(metrics.modulation, [0.75, 0.60, 0.40, 0.20]),
-        description: 'Однородность яркости темных и светлых элементов символа',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'RM',
-        nameRu: 'Запас отражательной способности',
-        gostRef: 'п. 5.6',
-        value: metrics.reflectanceMargin,
-        grade: metricToGrade(metrics.reflectanceMargin, [0.65, 0.45, 0.30, 0.15]),
-        description: 'Запас между значениями отражения и порогом декодирования',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'FPD',
-        nameRu: 'Повреждение фиксированного рисунка',
-        gostRef: 'п. 5.7',
-        value: metrics.fixedPatternDamage,
-        grade: metricToGrade(metrics.fixedPatternDamage, [0.85, 0.65, 0.45, 0.25]),
-        description: 'Целостность пограничного рисунка и рисунка синхронизации',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'ANU',
-        nameRu: 'Осевая неравномерность',
-        gostRef: 'п. 5.8',
-        value: metrics.axialNonUniformity,
-        grade: metricToGrade(metrics.axialNonUniformity, [0.80, 0.60, 0.40, 0.20]),
-        description: 'Равномерность размера элементов вдоль горизонтальной и вертикальной осей',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'GNU',
-        nameRu: 'Неравномерность сетки',
-        gostRef: 'п. 5.9',
-        value: metrics.gridNonUniformity,
-        grade: metricToGrade(metrics.gridNonUniformity, [0.82, 0.62, 0.42, 0.22]),
-        description: 'Отклонение центров элементов от узлов идеальной сетки',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'UEC',
-        nameRu: 'Неиспользованная коррекция ошибок',
-        gostRef: 'п. 5.10',
-        value: metrics.unusedErrorCorrection,
-        grade: metricToGrade(metrics.unusedErrorCorrection, [0.62, 0.50, 0.37, 0.25]),
-        description: 'Доля неиспользованного потенциала коррекции ошибок Рида-Соломона',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-      {
-        name: 'PG',
-        nameRu: 'Прирост печати',
-        gostRef: 'п. 5.11',
-        value: metrics.printGrowth,
-        grade: metricToGrade(metrics.printGrowth, [0.80, 0.60, 0.40, 0.20]),
-        description: 'Отклонение размеров элементов от номинальных значений',
-        min: 0,
-        max: 1,
-        unit: '%',
-      },
-    ];
+    // Перевод в float32 grayscale
+    const gray = new Float32Array(w * h);
+    for (let i = 0; i < gray.length; i++) {
+      gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+    }
+
+    const raw = analyzeDatamatrixISO(gray, w, h);
+
+    if (raw) {
+      params = [
+        {
+          name: 'SC', nameRu: 'Контраст символа', gostRef: 'п. 5.4',
+          value: raw.SC, grade: metricToGrade(raw.SC, 'SC'),
+          description: 'Разница между максимальным и минимальным отражением символа',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'MOD', nameRu: 'Модуляция', gostRef: 'п. 5.5',
+          value: raw.MOD, grade: metricToGrade(raw.MOD, 'MOD'),
+          description: 'Минимальный нормированный запас каждого модуля до порога декодирования (ERN)',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'RM', nameRu: 'Запас отражательной способности', gostRef: 'п. 5.6',
+          value: raw.RM, grade: metricToGrade(raw.RM, 'RM'),
+          description: 'Минимальный запас между отражением модуля и порогом декодирования',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'FPD', nameRu: 'Повреждение фиксированного рисунка', gostRef: 'п. 5.7',
+          value: raw.FPD, grade: metricToGrade(raw.FPD, 'FPD'),
+          description: 'Целостность граничного рисунка и рисунка синхронизации',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'ANU', nameRu: 'Осевая неравномерность', gostRef: 'п. 5.8',
+          value: raw.ANU, grade: metricToGrade(raw.ANU, 'ANU'),
+          description: 'Отношение разности шагов модуля по X и Y к среднему шагу',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'GNU', nameRu: 'Неравномерность сетки', gostRef: 'п. 5.9',
+          value: raw.GNU, grade: metricToGrade(raw.GNU, 'GNU'),
+          description: 'Отклонение позиций переходов от узлов идеальной сетки (95-й перцентиль)',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'UEC', nameRu: 'Неиспользованная коррекция ошибок', gostRef: 'п. 5.10',
+          value: raw.UEC, grade: metricToGrade(raw.UEC, 'UEC'),
+          description: 'Доля неиспользованного потенциала коррекции ошибок Рида-Соломона (ECC200)',
+          min: 0, max: 1, unit: '%',
+        },
+        {
+          name: 'PG', nameRu: 'Прирост печати', gostRef: 'п. 5.11',
+          value: raw.PG, grade: metricToGrade(raw.PG, 'PG'),
+          description: 'Равномерность яркостей внутри тёмных и светлых модулей',
+          min: 0, max: 1, unit: '%',
+        },
+      ];
+    } else {
+      params = failParams();
+    }
   } else {
-    const baseVal = 0.75 + Math.random() * 0.2;
-    parameters = [
-      { name: 'SC', nameRu: 'Контраст символа', gostRef: 'п. 5.4', value: baseVal, grade: 'A', description: 'Разница между максимальным и минимальным отражением символа', min: 0, max: 1, unit: '%' },
-      { name: 'MOD', nameRu: 'Модуляция', gostRef: 'п. 5.5', value: baseVal - 0.05, grade: 'A', description: 'Однородность яркости темных и светлых элементов символа', min: 0, max: 1, unit: '%' },
-      { name: 'RM', nameRu: 'Запас отражательной способности', gostRef: 'п. 5.6', value: baseVal - 0.1, grade: 'A', description: 'Запас между значениями отражения и порогом декодирования', min: 0, max: 1, unit: '%' },
-      { name: 'FPD', nameRu: 'Повреждение фиксированного рисунка', gostRef: 'п. 5.7', value: baseVal, grade: 'A', description: 'Целостность пограничного рисунка и рисунка синхронизации', min: 0, max: 1, unit: '%' },
-      { name: 'ANU', nameRu: 'Осевая неравномерность', gostRef: 'п. 5.8', value: baseVal - 0.02, grade: 'A', description: 'Равномерность размера элементов вдоль горизонтальной и вертикальной осей', min: 0, max: 1, unit: '%' },
-      { name: 'GNU', nameRu: 'Неравномерность сетки', gostRef: 'п. 5.9', value: baseVal - 0.03, grade: 'A', description: 'Отклонение центров элементов от узлов идеальной сетки', min: 0, max: 1, unit: '%' },
-      { name: 'UEC', nameRu: 'Неиспользованная коррекция ошибок', gostRef: 'п. 5.10', value: baseVal - 0.08, grade: 'A', description: 'Доля неиспользованного потенциала коррекции ошибок Рида-Соломона', min: 0, max: 1, unit: '%' },
-      { name: 'PG', nameRu: 'Прирост печати', gostRef: 'п. 5.11', value: baseVal - 0.04, grade: 'A', description: 'Отклонение размеров элементов от номинальных значений', min: 0, max: 1, unit: '%' },
-    ];
+    params = failParams();
   }
 
-  const grades = parameters.map(p => p.grade);
-  const overallGrade = getLowestGrade(grades);
-  const overallScore = grades.reduce((sum, g) => sum + gradeToScore(g), 0) / grades.length;
+  const grades      = params.map(p => p.grade);
+  const overallGrade = worstGrade(grades);
+  const overallScore = grades.reduce((s, g) => s + gradeToScore(g), 0) / grades.length;
 
   return {
     overallGrade,
     overallScore,
-    parameters,
+    parameters: params,
     decodedData,
     timestamp: new Date(),
     analysisTimeMs: performance.now() - start,
   };
 }
 
+function failParams(): QualityParameter[] {
+  const keys = ['SC', 'MOD', 'RM', 'FPD', 'ANU', 'GNU', 'UEC', 'PG'];
+  const namesRu: Record<string, string> = {
+    SC: 'Контраст символа', MOD: 'Модуляция', RM: 'Запас отражательной способности',
+    FPD: 'Повреждение фиксированного рисунка', ANU: 'Осевая неравномерность',
+    GNU: 'Неравномерность сетки', UEC: 'Неиспользованная коррекция ошибок', PG: 'Прирост печати',
+  };
+  const gosts: Record<string, string> = {
+    SC: 'п. 5.4', MOD: 'п. 5.5', RM: 'п. 5.6', FPD: 'п. 5.7',
+    ANU: 'п. 5.8', GNU: 'п. 5.9', UEC: 'п. 5.10', PG: 'п. 5.11',
+  };
+  return keys.map(k => ({
+    name: k, nameRu: namesRu[k], gostRef: gosts[k],
+    value: 0, grade: 'F', description: '', min: 0, max: 1, unit: '%',
+  }));
+}
+
 export function gradeColor(grade: Grade): string {
   const map: Record<Grade, string> = {
-    A: '#22c55e',
-    B: '#14b8a6',
-    C: '#eab308',
-    D: '#f97316',
-    F: '#ef4444',
+    A: '#22c55e', B: '#14b8a6', C: '#eab308', D: '#f97316', F: '#ef4444',
   };
   return map[grade];
 }
 
 export function gradeLabel(grade: Grade): string {
   const map: Record<Grade, string> = {
-    A: 'Отлично',
-    B: 'Хорошо',
-    C: 'Удовлетворительно',
-    D: 'Плохо',
-    F: 'Неудовлетворительно',
+    A: 'Отлично', B: 'Хорошо', C: 'Удовлетворительно', D: 'Плохо', F: 'Неудовлетворительно',
   };
   return map[grade];
 }
