@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { BrowserDatamatrixCodeReader, IScannerControls } from '@zxing/browser';
+import { BrowserDatamatrixCodeReader } from '@zxing/browser';
 import { DecodeHintType, Result, ResultPoint } from '@zxing/library';
 import { analyzeQuality, QualityResult, gradeColor, gradeLabel, Grade } from '@/lib/qualityAnalysis';
 import { playGradeSound } from '@/lib/audioFeedback';
@@ -13,7 +13,19 @@ export interface ScanRecord {
   result: QualityResult;
 }
 
-// ── Препроцессинг кадра на canvas ─────────────────────────────────────────────
+// ── Параметры — точное соответствие Python-проекту ───────────────────────────
+const DECODE_INTERVAL_MS = 150;   // _decode_interval = 0.15 сек
+const SCAN_LOCK_MS       = 1500;  // _scan_lock_ms
+
+// ── Препроцессинг кадра ───────────────────────────────────────────────────────
+function makeGray(data: Uint8ClampedArray): Float32Array {
+  const n = data.length / 4;
+  const g = new Float32Array(n);
+  for (let i = 0; i < n; i++)
+    g[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+  return g;
+}
+
 function stretchContrast(data: Uint8ClampedArray, gray: Float32Array): void {
   let minV = 255, maxV = 0;
   for (let i = 0; i < gray.length; i++) {
@@ -27,128 +39,102 @@ function stretchContrast(data: Uint8ClampedArray, gray: Float32Array): void {
   }
 }
 
+function applyGray(data: Uint8ClampedArray, gray: Float32Array): void {
+  for (let i = 0; i < gray.length; i++) {
+    const v = Math.round(Math.max(0, Math.min(255, gray[i])));
+    data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
+  }
+}
+
 function sharpen(gray: Float32Array, w: number, h: number): Float32Array {
   const out = new Float32Array(gray.length);
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const i = y * w + x;
-      const v = 5 * gray[i]
-        - gray[(y - 1) * w + x]
-        - gray[(y + 1) * w + x]
-        - gray[y * w + x - 1]
-        - gray[y * w + x + 1];
-      out[i] = Math.max(0, Math.min(255, v));
+      out[i] = Math.max(0, Math.min(255,
+        5 * gray[i] - gray[(y-1)*w+x] - gray[(y+1)*w+x] - gray[y*w+x-1] - gray[y*w+x+1]
+      ));
     }
   }
   return out;
 }
 
-function makeGray(data: Uint8ClampedArray): Float32Array {
-  const n = data.length / 4;
-  const g = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    g[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
-  }
-  return g;
+/** Создать canvas с применённым препроцессингом */
+function makeCanvas(data: Uint8ClampedArray, w: number, h: number): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const img = new ImageData(w, h);
+  img.data.set(data);
+  c.getContext('2d')!.putImageData(img, 0, 0);
+  return c;
 }
 
-function applyGray(data: Uint8ClampedArray, gray: Float32Array): void {
-  for (let i = 0; i < gray.length; i++) {
-    const v = gray[i];
-    data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
-  }
+/** Вырезать прямоугольную область из canvas */
+function cropCanvas(
+  src: HTMLCanvasElement, x: number, y: number, w: number, h: number
+): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d')!.drawImage(src, x, y, w, h, 0, 0, w, h);
+  return c;
 }
 
-function invert(data: Uint8ClampedArray): void {
-  for (let i = 0; i < data.length; i += 4) {
-    data[i] = 255 - data[i];
-    data[i + 1] = 255 - data[i + 1];
-    data[i + 2] = 255 - data[i + 2];
-  }
+/** Масштабировать canvas */
+function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
+  const w = Math.round(src.width * scale), h = Math.round(src.height * scale);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d')!.drawImage(src, 0, 0, w, h);
+  return c;
 }
 
-// ── Создание вариантов для декодирования ──────────────────────────────────────
-function makePreprocessedCanvases(
-  src: HTMLCanvasElement
-): HTMLCanvasElement[] {
-  const w = src.width, h = src.height;
-  if (w === 0 || h === 0) return [];
-
-  const srcCtx = src.getContext('2d')!;
-  const orig    = srcCtx.getImageData(0, 0, w, h);
-  const gray    = makeGray(orig.data);
-
-  const variants: { data: Uint8ClampedArray; width: number; height: number }[] = [];
-
-  // 1. Контраст-стретч (серый)
-  const d1 = new Uint8ClampedArray(orig.data);
-  stretchContrast(d1, gray);
-  variants.push({ data: d1, width: w, height: h });
-
-  // 2. Контраст-стретч + инверсия
-  const d2 = new Uint8ClampedArray(d1);
-  invert(d2);
-  variants.push({ data: d2, width: w, height: h });
-
-  // 3. Резкость
-  const sharpGray = sharpen(gray, w, h);
-  const d3 = new Uint8ClampedArray(orig.data);
-  applyGray(d3, sharpGray);
-  variants.push({ data: d3, width: w, height: h });
-
-  // 4. Центральный ROI (70%) с контраст-стретчем
-  const cx = Math.floor(w * 0.15), cy = Math.floor(h * 0.15);
-  const cw = w - 2 * cx,           ch = h - 2 * cy;
-  const roiCtx = document.createElement('canvas');
-  roiCtx.width = cw; roiCtx.height = ch;
-  const rc = roiCtx.getContext('2d')!;
-  rc.drawImage(src, cx, cy, cw, ch, 0, 0, cw, ch);
-  const roiImg = rc.getImageData(0, 0, cw, ch);
-  const roiGray = makeGray(roiImg.data);
-  const d4 = new Uint8ClampedArray(roiImg.data);
-  stretchContrast(d4, roiGray);
-  variants.push({ data: d4, width: cw, height: ch });
-
-  // 5. Масштаб 1.5× оригинала
-  const sw = Math.round(w * 1.5), sh = Math.round(h * 1.5);
-  const sc = document.createElement('canvas');
-  sc.width = sw; sc.height = sh;
-  const scc = sc.getContext('2d')!;
-  scc.drawImage(src, 0, 0, sw, sh);
-  const si = scc.getImageData(0, 0, sw, sh);
-  const sg = makeGray(si.data);
-  stretchContrast(si.data, sg);
-  variants.push({ data: si.data, width: sw, height: sh });
-
-  return variants.map(({ data, width, height }) => {
-    const c = document.createElement('canvas');
-    c.width = width; c.height = height;
-    const imgData = new ImageData(width, height);
-    imgData.data.set(data);
-    c.getContext('2d')!.putImageData(imgData, 0, 0);
-    return c;
-  });
+// ── Тип результата декодирования ──────────────────────────────────────────────
+interface DecodeHit {
+  text:    string;
+  pts:     readonly ResultPoint[] | null;
+  offsetX: number;
+  offsetY: number;
 }
 
+/** Попытка декодировать один canvas ZXing-ом */
+async function tryDecodeCanvas(
+  reader: BrowserDatamatrixCodeReader,
+  canvas: HTMLCanvasElement,
+  offsetX = 0,
+  offsetY = 0
+): Promise<DecodeHit | null> {
+  try {
+    const r: Result = await (reader as any).decodeFromCanvas(canvas);
+    if (r) return { text: r.getText(), pts: r.getResultPoints(), offsetX, offsetY };
+  } catch {}
+  return null;
+}
 
 export default function Scanner() {
-  const videoRef    = useRef<HTMLVideoElement>(null);
-  const canvasRef   = useRef<HTMLCanvasElement>(null);
-  const readerRef   = useRef<BrowserDatamatrixCodeReader | null>(null);
-  const controlsRef = useRef<IScannerControls | null>(null);
+  const videoRef   = useRef<HTMLVideoElement>(null);
+  const canvasRef  = useRef<HTMLCanvasElement>(null);
+  const readerRef  = useRef<BrowserDatamatrixCodeReader | null>(null);
+  const streamRef  = useRef<MediaStream | null>(null);
+
+  // Флаги и дескрипторы циклов
+  const runningRef      = useRef(false);
+  const decodingRef     = useRef(false);
+  const rafRef          = useRef<number | null>(null);
+  const decodeTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Scan-lock (аналог Python _last_decoded / _last_decoded_t)
   const lastDecoded     = useRef<string>('');
   const lastDecodedTime = useRef<number>(0);
-  const preprocessTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const [cameras, setCameras]           = useState<MediaDeviceInfo[]>([]);
+  const [cameras, setCameras]             = useState<MediaDeviceInfo[]>([]);
   const [selectedCamera, setSelectedCamera] = useState<string>('');
-  const [scanning, setScanning]         = useState(false);
+  const [scanning, setScanning]           = useState(false);
   const [currentResult, setCurrentResult] = useState<QualityResult | null>(null);
-  const [history, setHistory]           = useState<ScanRecord[]>([]);
-  const [cameraError, setCameraError]   = useState<string>('');
-  const [soundEnabled, setSoundEnabled] = useState(true);
-  const [activeTab, setActiveTab]       = useState<'scan' | 'history'>('scan');
-  const [fps, setFps]                   = useState(0);
+  const [history, setHistory]             = useState<ScanRecord[]>([]);
+  const [cameraError, setCameraError]     = useState<string>('');
+  const [soundEnabled, setSoundEnabled]   = useState(true);
+  const [activeTab, setActiveTab]         = useState<'scan' | 'history'>('scan');
+  const [fps, setFps]                     = useState(0);
 
   const fpsCounter = useRef({ frames: 0, last: Date.now() });
 
@@ -156,51 +142,30 @@ export default function Scanner() {
     BrowserDatamatrixCodeReader.listVideoInputDevices().then((devices) => {
       setCameras(devices);
       if (devices.length > 0) {
-        const backCamera = devices.find(d =>
+        const back = devices.find(d =>
           d.label.toLowerCase().includes('back') ||
           d.label.toLowerCase().includes('rear') ||
           d.label.toLowerCase().includes('environment')
         );
-        setSelectedCamera(backCamera ? backCamera.deviceId : devices[devices.length - 1].deviceId);
+        // Последняя камера — обычно наилучшего качества
+        setSelectedCamera(back?.deviceId ?? devices[devices.length - 1].deviceId);
       }
     }).catch(() => {
       setCameraError('Не удалось получить список камер. Разрешите доступ к камере в браузере.');
     });
   }, []);
 
-  const captureFrame = useCallback((): HTMLCanvasElement | null => {
-    const video  = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < 2) return null;
-    canvas.width  = video.videoWidth  || 640;
-    canvas.height = video.videoHeight || 480;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    ctx.drawImage(video, 0, 0);
-
-    const f = fpsCounter.current;
-    f.frames++;
-    const now = Date.now();
-    if (now - f.last >= 1000) {
-      setFps(f.frames);
-      f.frames = 0;
-      f.last   = now;
-    }
-    return canvas;
-  }, []);
-
-  /**
-   * Вычислить ROI вокруг DataMatrix из result points ZXing.
-   * Если точки недоступны — возвращает центральные 50% кадра.
-   */
+  // ── ROI из result points (с учётом смещения кропа) ───────────────────────
   const computeRoi = useCallback((
     frame: HTMLCanvasElement,
-    pts?: readonly ResultPoint[] | null
+    pts:   readonly ResultPoint[] | null,
+    ox:    number,
+    oy:    number
   ): { x: number; y: number; w: number; h: number } => {
     const fw = frame.width, fh = frame.height;
     if (pts && pts.length >= 2) {
-      const xs = Array.from(pts).map(p => p.getX());
-      const ys = Array.from(pts).map(p => p.getY());
+      const xs = Array.from(pts).map(p => p.getX() + ox);
+      const ys = Array.from(pts).map(p => p.getY() + oy);
       const minX = Math.min(...xs), maxX = Math.max(...xs);
       const minY = Math.min(...ys), maxY = Math.max(...ys);
       const sw = maxX - minX, sh = maxY - minY;
@@ -218,92 +183,175 @@ export default function Scanner() {
     return { x: mx, y: my, w: fw - 2 * mx, h: fh - 2 * my };
   }, []);
 
-  const handleDecoded = useCallback((
-    text: string,
-    pts?: readonly ResultPoint[] | null,
-    srcCanvas?: HTMLCanvasElement | null
-  ) => {
+  // ── Обработка успешного декодирования ────────────────────────────────────
+  const handleDecoded = useCallback((hit: DecodeHit, frame: HTMLCanvasElement) => {
     const now = Date.now();
-    if (text === lastDecoded.current && now - lastDecodedTime.current < 1500) return;
-    lastDecoded.current     = text;
+    // Scan-lock: тот же код в течение SCAN_LOCK_MS — пропускаем
+    if (hit.text === lastDecoded.current && now - lastDecodedTime.current < SCAN_LOCK_MS) return;
+
+    lastDecoded.current     = hit.text;
     lastDecodedTime.current = now;
 
+    // Авто-сброс scan-lock через SCAN_LOCK_MS — сразу ищем следующий код
     setTimeout(() => {
       lastDecoded.current     = '';
       lastDecodedTime.current = 0;
-    }, 1500);
+    }, SCAN_LOCK_MS);
 
-    const frame = srcCanvas ?? captureFrame();
-    if (!frame) return;
-
-    // Передаём точный ROI символа в анализатор — иначе весь кадр
-    const roi = computeRoi(frame, pts);
-    const result = analyzeQuality(frame, text, roi);
+    const roi    = computeRoi(frame, hit.pts, hit.offsetX, hit.offsetY);
+    const result = analyzeQuality(frame, hit.text, roi);
     if (soundEnabled) playGradeSound(result.overallGrade);
     setCurrentResult(result);
     setHistory(prev => [
       { id: `${now}-${Math.random().toString(36).slice(2)}`, result },
       ...prev.slice(0, 49),
     ]);
-  }, [soundEnabled, captureFrame, computeRoi]);
+  }, [soundEnabled, computeRoi]);
 
-  // ── Параллельный цикл препроцессинга ──────────────────────────────────────
-  const startPreprocessLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
-    if (preprocessTimerRef.current) clearInterval(preprocessTimerRef.current);
+  // ── Поток 1: захват кадров (requestAnimationFrame) ────────────────────────
+  // Аналог Python _capture_loop
+  const startCaptureLoop = useCallback(() => {
+    const loop = () => {
+      if (!runningRef.current) return;
+      const video  = videoRef.current;
+      const canvas = canvasRef.current;
+      if (video && canvas && video.readyState >= 2) {
+        canvas.width  = video.videoWidth  || 640;
+        canvas.height = video.videoHeight || 480;
+        canvas.getContext('2d')!.drawImage(video, 0, 0);
 
-    preprocessTimerRef.current = setInterval(async () => {
-      const canvas = captureFrame();
-      if (!canvas) return;
-
-      const variants = makePreprocessedCanvases(canvas);
-      for (const variant of variants) {
-        try {
-          const zxResult: Result | null = await (reader as any).decodeFromCanvas(variant);
-          if (zxResult) {
-            handleDecoded(zxResult.getText(), zxResult.getResultPoints(), canvas);
-            break;
-          }
-        } catch {
-          // нет кода — продолжаем
+        const f = fpsCounter.current;
+        f.frames++;
+        const now = Date.now();
+        if (now - f.last >= 1000) {
+          setFps(f.frames);
+          f.frames = 0;
+          f.last   = now;
         }
       }
-    }, 120);
-  }, [captureFrame, handleDecoded]);
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+  }, []);
 
-  const stopPreprocessLoop = useCallback(() => {
-    if (preprocessTimerRef.current) {
-      clearInterval(preprocessTimerRef.current);
-      preprocessTimerRef.current = null;
+  // ── Поток 2: декодирование (setInterval 150ms) ────────────────────────────
+  // Аналог Python _decode_loop с _decode_interval = 0.15
+  // 3 шага: полный кадр → центральная зона → препроцессинг
+  const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
+    if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
+
+    decodeTimerRef.current = setInterval(async () => {
+      if (decodingRef.current || !runningRef.current) return;
+      const canvas = canvasRef.current;
+      if (!canvas || canvas.width === 0 || canvas.height === 0) return;
+
+      decodingRef.current = true;
+      try {
+        const fw = canvas.width, fh = canvas.height;
+        let hit: DecodeHit | null = null;
+
+        // ── Шаг 1: полный кадр (аналог Python step 1) ──────────────────
+        hit = await tryDecodeCanvas(reader, canvas);
+
+        // ── Шаг 2: центральная зона 70% (аналог Python step 2, m=0.15) ─
+        if (!hit) {
+          const m  = 0.15;
+          const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
+          const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
+          if (cw > 20 && ch > 20) {
+            hit = await tryDecodeCanvas(reader, cropCanvas(canvas, cx, cy, cw, ch), cx, cy);
+          }
+        }
+
+        // ── Шаг 3: препроцессинг (аналог Python try_decode_dmtx variants) ─
+        // CLAHE-аппроксимация, резкость, инверсия, масштаб 1.5×
+        if (!hit) {
+          const ctx  = canvas.getContext('2d')!;
+          const img  = ctx.getImageData(0, 0, fw, fh);
+          const gray = makeGray(img.data);
+
+          // 3a: контраст-стретч
+          const d1 = new Uint8ClampedArray(img.data);
+          stretchContrast(d1, gray);
+          hit = await tryDecodeCanvas(reader, makeCanvas(d1, fw, fh));
+
+          // 3b: контраст + инверсия (тёмный фон)
+          if (!hit) {
+            const d2 = new Uint8ClampedArray(d1);
+            for (let i = 0; i < d2.length; i += 4) {
+              d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
+            }
+            hit = await tryDecodeCanvas(reader, makeCanvas(d2, fw, fh));
+          }
+
+          // 3c: резкость
+          if (!hit) {
+            const sg = sharpen(gray, fw, fh);
+            const d3 = new Uint8ClampedArray(img.data);
+            applyGray(d3, sg);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d3, fw, fh));
+          }
+
+          // 3d: масштаб 1.5× центрального кропа (маленький символ)
+          if (!hit) {
+            const m  = 0.20;
+            const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
+            const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
+            if (cw > 20 && ch > 20) {
+              hit = await tryDecodeCanvas(
+                reader,
+                scaleCanvas(cropCanvas(canvas, cx, cy, cw, ch), 1.5),
+                cx, cy
+              );
+            }
+          }
+        }
+
+        if (hit) handleDecoded(hit, canvas);
+      } finally {
+        decodingRef.current = false;
+      }
+    }, DECODE_INTERVAL_MS);
+  }, [handleDecoded]);
+
+  // ── Запуск/остановка сканирования ─────────────────────────────────────────
+  const stopAllLoops = useCallback(() => {
+    runningRef.current = false;
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (decodeTimerRef.current !== null) {
+      clearInterval(decodeTimerRef.current);
+      decodeTimerRef.current = null;
     }
   }, []);
+
+  const stopScanning = useCallback(() => {
+    stopAllLoops();
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setScanning(false);
+    setFps(0);
+  }, [stopAllLoops]);
 
   const startScanning = useCallback(async () => {
     if (!selectedCamera) return;
     setCameraError('');
+    stopAllLoops();
+
     try {
-      if (controlsRef.current) {
-        controlsRef.current.stop();
-        controlsRef.current = null;
-      }
-      stopPreprocessLoop();
-
-      // TRY_HARDER: ищет код в большем количестве позиций
-      const hints = new Map<DecodeHintType, any>();
-      hints.set(DecodeHintType.TRY_HARDER, true);
-
-      const reader = new BrowserDatamatrixCodeReader(hints, {
-        delayBetweenScanAttempts: 50,
-        delayBetweenScanSuccess:  1500,
-      });
-      readerRef.current = reader;
-
+      // Получаем камеру (3 попытки с деградацией ограничений)
       let stream: MediaStream | null = null;
       try {
         const constraints: any = {
           deviceId: { exact: selectedCamera },
           width:     { ideal: 1920, min: 1280 },
           height:    { ideal: 1080, min: 720 },
-          frameRate: { ideal: 60, min: 30 },
+          frameRate: { ideal: 60,   min: 30  },
           focusMode: 'continuous',
         };
         stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
@@ -321,43 +369,28 @@ export default function Scanner() {
         }
       }
 
+      streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
 
-      // Основной цикл ZXing (оригинальный кадр)
-      const controls = await reader.decodeFromStream(
-        stream,
-        videoRef.current ?? undefined,
-        (result: Result | null | undefined) => {
-          if (result) handleDecoded(result.getText(), result.getResultPoints());
-        }
-      );
-      controlsRef.current = controls;
+      // Создаём ZXing reader с TRY_HARDER
+      const hints = new Map<DecodeHintType, any>();
+      hints.set(DecodeHintType.TRY_HARDER, true);
+      const reader = new BrowserDatamatrixCodeReader(hints);
+      readerRef.current = reader;
 
-      // Параллельный цикл с препроцессингом
-      startPreprocessLoop(reader);
+      runningRef.current = true;
+      startCaptureLoop();        // Поток 1: захват кадров
+      startDecodeLoop(reader);   // Поток 2: декодирование
 
       setScanning(true);
     } catch (e: any) {
       setCameraError(`Ошибка запуска камеры: ${e?.message || e}`);
       setScanning(false);
     }
-  }, [selectedCamera, handleDecoded, startPreprocessLoop, stopPreprocessLoop]);
-
-  const stopScanning = useCallback(() => {
-    stopPreprocessLoop();
-    if (controlsRef.current) {
-      controlsRef.current.stop();
-      controlsRef.current = null;
-    }
-    if (videoRef.current?.srcObject) {
-      (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
-      videoRef.current.srcObject = null;
-    }
-    setScanning(false);
-  }, [stopPreprocessLoop]);
+  }, [selectedCamera, stopAllLoops, startCaptureLoop, startDecodeLoop]);
 
   useEffect(() => () => { stopScanning(); }, []);
 
