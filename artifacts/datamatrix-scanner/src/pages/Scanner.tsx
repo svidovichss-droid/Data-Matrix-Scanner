@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { BrowserDatamatrixCodeReader, IScannerControls } from '@zxing/browser';
-import { DecodeHintType, Result } from '@zxing/library';
+import { DecodeHintType, Result, ResultPoint } from '@zxing/library';
 import { analyzeQuality, QualityResult, gradeColor, gradeLabel, Grade } from '@/lib/qualityAnalysis';
 import { playGradeSound } from '@/lib/audioFeedback';
 import GradeDisplay from '@/components/GradeDisplay';
@@ -189,29 +189,63 @@ export default function Scanner() {
     return canvas;
   }, []);
 
-  const handleDecoded = useCallback((text: string, canvas?: HTMLCanvasElement | null) => {
+  /**
+   * Вычислить ROI вокруг DataMatrix из result points ZXing.
+   * Если точки недоступны — возвращает центральные 50% кадра.
+   */
+  const computeRoi = useCallback((
+    frame: HTMLCanvasElement,
+    pts?: readonly ResultPoint[] | null
+  ): { x: number; y: number; w: number; h: number } => {
+    const fw = frame.width, fh = frame.height;
+    if (pts && pts.length >= 2) {
+      const xs = Array.from(pts).map(p => p.getX());
+      const ys = Array.from(pts).map(p => p.getY());
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const sw = maxX - minX, sh = maxY - minY;
+      if (sw > 4 && sh > 4) {
+        const margin = Math.max(sw, sh) * 0.25;
+        const rx = Math.max(0, Math.floor(minX - margin));
+        const ry = Math.max(0, Math.floor(minY - margin));
+        const rw = Math.min(fw - rx, Math.ceil(sw + 2 * margin));
+        const rh = Math.min(fh - ry, Math.ceil(sh + 2 * margin));
+        if (rw > 10 && rh > 10) return { x: rx, y: ry, w: rw, h: rh };
+      }
+    }
+    // Fallback: центральные 50% кадра
+    const mx = Math.floor(fw * 0.25), my = Math.floor(fh * 0.25);
+    return { x: mx, y: my, w: fw - 2 * mx, h: fh - 2 * my };
+  }, []);
+
+  const handleDecoded = useCallback((
+    text: string,
+    pts?: readonly ResultPoint[] | null,
+    srcCanvas?: HTMLCanvasElement | null
+  ) => {
     const now = Date.now();
     if (text === lastDecoded.current && now - lastDecodedTime.current < 1500) return;
     lastDecoded.current     = text;
     lastDecodedTime.current = now;
 
-    // Сброс через 1.5 сек — сразу ищем следующий
     setTimeout(() => {
       lastDecoded.current     = '';
       lastDecodedTime.current = 0;
     }, 1500);
 
-    const frame = canvas ?? captureFrame();
+    const frame = srcCanvas ?? captureFrame();
     if (!frame) return;
 
-    const result = analyzeQuality(frame, text);
+    // Передаём точный ROI символа в анализатор — иначе весь кадр
+    const roi = computeRoi(frame, pts);
+    const result = analyzeQuality(frame, text, roi);
     if (soundEnabled) playGradeSound(result.overallGrade);
     setCurrentResult(result);
     setHistory(prev => [
       { id: `${now}-${Math.random().toString(36).slice(2)}`, result },
       ...prev.slice(0, 49),
     ]);
-  }, [soundEnabled, captureFrame]);
+  }, [soundEnabled, captureFrame, computeRoi]);
 
   // ── Параллельный цикл препроцессинга ──────────────────────────────────────
   const startPreprocessLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
@@ -224,9 +258,9 @@ export default function Scanner() {
       const variants = makePreprocessedCanvases(canvas);
       for (const variant of variants) {
         try {
-          const result = await (reader as any).decodeFromCanvas(variant);
-          if (result) {
-            handleDecoded(result.getText(), canvas);
+          const zxResult: Result | null = await (reader as any).decodeFromCanvas(variant);
+          if (zxResult) {
+            handleDecoded(zxResult.getText(), zxResult.getResultPoints(), canvas);
             break;
           }
         } catch {
@@ -297,7 +331,7 @@ export default function Scanner() {
         stream,
         videoRef.current ?? undefined,
         (result: Result | null | undefined) => {
-          if (result) handleDecoded(result.getText());
+          if (result) handleDecoded(result.getText(), result.getResultPoints());
         }
       );
       controlsRef.current = controls;
