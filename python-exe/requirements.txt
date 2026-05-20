@@ -2,16 +2,3 @@ opencv-python>=4.8.0
 pylibdmtx>=0.1.5
 Pillow>=10.0.0
 numpy>=1.24.0
-
-# ── Опциональные промышленные камеры ──────────────────────────────────────────
-# Раскомментируйте нужные строки перед сборкой EXE
-
-# Basler GigE / USB3 Vision (требует Basler pylon SDK)
-# pypylon>=4.0.0
-
-# GenICam / GigE Vision через Harvesters (универсальный GenTL-клиент)
-# harvesters>=1.4.0
-# genicam>=1.1.0
-
-# FLIR / Teledyne (требует Spinnaker SDK от FLIR)
-# spinnaker-python   # устанавливается вручную из Spinnaker SDK
