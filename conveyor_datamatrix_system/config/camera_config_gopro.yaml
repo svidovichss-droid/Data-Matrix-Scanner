@@ -1,0 +1,74 @@
+# GoPro Camera Configuration for Industrial DataMatrix System
+
+camera:
+  # Camera type: 'gopro' for GoPro Hero 8+ in USB webcam mode
+  type: gopro
+  
+  # Camera identifier (device index, typically 0 for first USB camera)
+  id: 0
+  
+  # Image acquisition settings
+  settings:
+    width: 1920
+    height: 1080
+    pixel_format: Mono8
+    exposure_time: 5000  # microseconds (limited control in USB mode)
+    gain: 10.0  # dB (limited control in USB mode)
+    fps: 30
+    
+  # Trigger configuration (disabled for GoPro continuous mode)
+  trigger:
+    enabled: false
+    mode: continuous
+    
+  # Region of Interest (optional, reduces processing time)
+  roi:
+    enabled: false
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+
+# Processing pipeline
+processing:
+  num_workers: 4
+  buffer_size: 10
+  
+  preprocessing:
+    contrast_enhancement: true
+    denoise: true
+    denoise_strength: 5
+    sharpen: false
+    binarization: adaptive
+    binarization_block_size: 11
+    binarization_c_value: 2
+    
+  detection:
+    min_size: 20
+    max_size: 500
+    strategy: balanced
+    
+  decoder:
+    backend: zbar
+    multiple_codes: true
+    confidence_threshold: 0.7
+    max_attempts: 3
+
+# Output configuration
+output:
+  format: console
+  include_metadata: true
+  timestamp_format: "%Y-%m-%d %H:%M:%S.%f"
+
+# Logging
+logging:
+  level: INFO
+  file: logs/gopro_system.log
+  max_size_mb: 10
+  backup_count: 5
+
+# Performance monitoring
+monitoring:
+  enabled: true
+  metrics_interval_sec: 5
+  log_performance: true

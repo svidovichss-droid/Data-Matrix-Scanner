@@ -1,7 +1,7 @@
 # Camera Configuration for Industrial DataMatrix System
 
 camera:
-  # Camera type: 'usb', 'gige', 'basler', 'flir', 'test'
+  # Camera type: 'usb', 'gige', 'basler', 'flir', 'test', 'gopro'
   type: test
   
   # Camera identifier (device index, IP address, or serial number)
