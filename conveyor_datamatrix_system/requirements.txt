@@ -10,6 +10,9 @@ scikit-image>=0.21.0
 # flir-spinnaker>=2.0.0  # FLIR cameras
 # harvesters>=3.0.0  # Generic GigE Vision/USB3 Vision
 
+# GoPro camera support (uses opencv-python for USB webcam mode)
+# Note: opencv-python-headless is sufficient for most GoPro models in webcam mode
+
 # Optional: GPU acceleration
 # cupy-cuda11x>=12.0.0  # For NVIDIA GPUs
 
