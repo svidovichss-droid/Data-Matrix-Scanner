@@ -67,6 +67,73 @@ def decode_with_multiple_methods(images):
     return unique_results
 
 
+def trekvision_1_decode(image):
+    """
+    Метод TREKVISION-1: Продвинутое декодирование с использованием
+    множественных масштабов и ориентаций для максимального качества
+    """
+    all_results = []
+    
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Масштабирование для разных размеров кодов
+    scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    
+    for scale in scales:
+        resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        
+        # Базовое декодирование
+        decoded = pyzbar.decode(resized)
+        all_results.extend(decoded)
+        
+        # Бинаризация Оцу
+        _, binary_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        decoded_otsu = pyzbar.decode(binary_otsu)
+        all_results.extend(decoded_otsu)
+        
+        # Инвертированная бинаризация
+        _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        decoded_inv = pyzbar.decode(binary_inv)
+        all_results.extend(decoded_inv)
+    
+    # Поворот изображения для поиска под разными углами
+    angles = [90, 180, 270, 45, 135, 225, 315]
+    for angle in angles:
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        rotated = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated_img = cv2.warpAffine(gray, rotated, (w, h), flags=cv2.INTER_CUBIC)
+        
+        decoded_rotated = pyzbar.decode(rotated_img)
+        all_results.extend(decoded_rotated)
+    
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced_clahe = clahe.apply(gray)
+    decoded_clahe = pyzbar.decode(enhanced_clahe)
+    all_results.extend(decoded_clahe)
+    
+    # Комбинация CLAHE + бинаризация
+    _, binary_clahe = cv2.threshold(enhanced_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    decoded_clahe_bin = pyzbar.decode(binary_clahe)
+    all_results.extend(decoded_clahe_bin)
+    
+    # Удаляем дубликаты по данным
+    unique_results = []
+    seen_data = set()
+    
+    for obj in all_results:
+        data = obj.data.decode('utf-8', errors='ignore') if obj.data else ""
+        if data and data not in seen_data:
+            seen_data.add(data)
+            unique_results.append(obj)
+    
+    return unique_results
+
+
 def main():
     # Инициализация захвата с камеры (0 - основная камера)
     # Для уменьшения задержки можно попробовать бэкенды: cv2.CAP_DSHOW (Windows) или cv2.CAP_V4L2 (Linux)
@@ -93,9 +160,13 @@ def main():
     last_scan_result = "Нет данных"
     last_scan_time = 0
 
-    print(f"Нажмите 'q' для выхода, 's' для сохранения кадра, 'h' для вывода истории.")
+    print(f"Нажмите 'q' для выхода, 's' для сохранения кадра, 'h' для вывода истории, 't' для переключения режима.")
     print(f"История обработки: до {MAX_HISTORY} позиций")
-    print(f"Режим: Улучшенное декодирование с множественными методами")
+    print(f"Режим: TREKVISION-1 (продвинутое декодирование)")
+    print(f"Нажмите 't' для переключения между TREKVISION-1 и стандартным режимом")
+    
+    # Флаг для выбора режима декодирования
+    use_trekvision = True  # True = использовать TREKVISION-1, False = стандартный режим
 
     while True:
         start_time = time.time()
@@ -109,11 +180,14 @@ def main():
 
         # --- БЛОК ОБРАБОТКИ: Сканер DataMatrix/QR с улучшенным декодированием ---
         
-        # Создаем несколько версий изображения для лучшего распознавания
-        enhanced_images = enhance_image_for_decoding(frame)
-        
-        # Декодирование с использованием всех методов
-        decoded_objects = decode_with_multiple_methods(enhanced_images)
+        # Декодирование с использованием TREKVISION-1 или стандартного метода
+        if use_trekvision:
+            decoded_objects = trekvision_1_decode(frame)
+        else:
+            # Создаем несколько версий изображения для лучшего распознавания
+            enhanced_images = enhance_image_for_decoding(frame)
+            # Декодирование с использованием всех методов
+            decoded_objects = decode_with_multiple_methods(enhanced_images)
         
         processed_frame = frame.copy()
         
@@ -168,6 +242,12 @@ def main():
         cv2.putText(result, f"Total Scanned: {total_scanned}", 
                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
+        # Индикатор текущего режима декодирования
+        mode_display = "TREKVISION-1" if use_trekvision else "STANDARD"
+        mode_color = (0, 255, 255) if use_trekvision else (255, 255, 255)
+        cv2.putText(result, f"Mode: {mode_display}", (10, 120), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
+        
         # Показываем последние 5 записей истории прямо на экране
         y_offset = 130
         cv2.putText(result, "Last 5 scans:", (10, y_offset), 
@@ -211,6 +291,11 @@ def main():
                       f"Scan: {entry.get('last_scan', 'No data')}")
             print(f"Всего записей в истории: {len(processing_history)}")
             print(f"Всего отсканировано: {total_scanned}\n")
+        elif key == ord('t'):
+            # Переключение режима TREKVISION-1
+            use_trekvision = not use_trekvision
+            mode_text = "TREKVISION-1" if use_trekvision else "Стандартный"
+            print(f"\n>>> Режим декодирования переключен на: {mode_text} <<<\n")
 
     # Освобождение ресурсов
     cap.release()
