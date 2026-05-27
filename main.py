@@ -4,6 +4,69 @@ from collections import deque
 from pyzbar import pyzbar
 import numpy as np
 
+def enhance_image_for_decoding(image):
+    """
+    Улучшенное предображение изображения для лучшего декодирования
+    """
+    # Конвертация в grayscale
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Применяем фильтр Гаусса для уменьшения шума
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Адаптивная бинаризация (лучше для неравномерного освещения)
+    binary_adaptive = cv2.adaptiveThreshold(
+        blurred, 
+        255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 
+        11, 
+        2
+    )
+    
+    # Морфологические операции для улучшения качества
+    kernel = np.ones((2, 2), np.uint8)
+    denoised = cv2.morphologyOps(binary_adaptive, cv2.MORPH_CLOSE, kernel)
+    denoised = cv2.morphologyOps(denoised, cv2.MORPH_OPEN, kernel)
+    
+    return [gray, blurred, binary_adaptive, denoised]
+
+
+def decode_with_multiple_methods(images):
+    """
+    Попытка декодирования несколькими методами для максимального качества
+    """
+    all_results = []
+    
+    for img in images:
+        # Основное декодирование
+        decoded = pyzbar.decode(img)
+        all_results.extend(decoded)
+        
+        # Декодирование с увеличенной резкостью
+        if len(img.shape) == 2:
+            # Применяем unsharp mask для повышения резкости
+            gaussian = cv2.GaussianBlur(img, (0, 0), 3.0)
+            sharpened = cv2.addWeighted(img, 1.5, gaussian, -0.5, 0, img)
+            decoded_sharp = pyzbar.decode(sharpened)
+            all_results.extend(decoded_sharp)
+    
+    # Удаляем дубликаты по данным
+    unique_results = []
+    seen_data = set()
+    
+    for obj in all_results:
+        data = obj.data.decode('utf-8', errors='ignore') if obj.data else ""
+        if data and data not in seen_data:
+            seen_data.add(data)
+            unique_results.append(obj)
+    
+    return unique_results
+
+
 def main():
     # Инициализация захвата с камеры (0 - основная камера)
     # Для уменьшения задержки можно попробовать бэкенды: cv2.CAP_DSHOW (Windows) или cv2.CAP_V4L2 (Linux)
@@ -32,6 +95,7 @@ def main():
 
     print(f"Нажмите 'q' для выхода, 's' для сохранения кадра, 'h' для вывода истории.")
     print(f"История обработки: до {MAX_HISTORY} позиций")
+    print(f"Режим: Улучшенное декодирование с множественными методами")
 
     while True:
         start_time = time.time()
@@ -43,21 +107,20 @@ def main():
             print("Ошибка: Не удалось захватить кадр.")
             break
 
-        # --- БЛОК ОБРАБОТКИ: Сканер DataMatrix/QR ---
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # --- БЛОК ОБРАБОТКИ: Сканер DataMatrix/QR с улучшенным декодированием ---
         
-        # Улучшение контраста для лучшего распознавания
-        gray = cv2.equalizeHist(gray)
+        # Создаем несколько версий изображения для лучшего распознавания
+        enhanced_images = enhance_image_for_decoding(frame)
         
-        # Декодирование штрих-кодов и DataMatrix
-        decoded_objects = pyzbar.decode(gray)
+        # Декодирование с использованием всех методов
+        decoded_objects = decode_with_multiple_methods(enhanced_images)
         
         processed_frame = frame.copy()
         
         for obj in decoded_objects:
             # Получаем тип и данные
             obj_type = obj.type
-            obj_data = obj.data.decode('utf-8') if obj.data else "N/A"
+            obj_data = obj.data.decode('utf-8', errors='ignore') if obj.data else "N/A"
             
             # Получаем координаты ограничивающей рамки
             points = obj.polygon
