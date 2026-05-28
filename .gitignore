@@ -1,1 +1,33 @@
-Nothing should be ignored based on the provided file changes. The modification of 'main.py' represents a source code file change, which does not warrant any additions to the .gitignore file.
+```gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# IDE
+.vscode/
+.idea/
+
+# Environment files
+.env
+.env.local
+*.env.*
+```
