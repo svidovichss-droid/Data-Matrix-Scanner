@@ -161,6 +161,7 @@ class DataMatrixDecoder:
         Apply preprocessing to enhance DataMatrix code visibility.
         Returns multiple preprocessed versions with method labels for robust detection.
         
+        Optimized for speed: minimal preprocessing in FAST mode.
         Enhanced with overexposure compensation and glare reduction for bright camera conditions.
         """
         preprocessed_images = []
@@ -177,33 +178,30 @@ class DataMatrixDecoder:
         # Base preprocessing
         preprocessed_images.append((gray, 'original'))
         
-        # Overexposure and glare compensation (applied early in pipeline)
-        if self.compensate_overexposure or self.glare_reduction:
-            compensated = self._compensate_overexposure_and_glare(gray)
-            if compensated is not None:
-                preprocessed_images.append((compensated, 'overexposure_compensated'))
-        
-        # Print gain correction for improved contrast in printed codes
-        if self.print_gain_correction:
-            gain_corrected = self._apply_print_gain_correction(gray)
-            if gain_corrected is not None:
-                preprocessed_images.append((gain_corrected, 'print_gain_corrected'))
-            
-            # Also apply to compensated image if available
-            if self.compensate_overexposure and len(preprocessed_images) > 1:
-                gain_on_compensated = self._apply_print_gain_correction(compensated)
-                if gain_on_compensated is not None:
-                    preprocessed_images.append((gain_on_compensated, 'compensated_gain_corrected'))
-        
-        # Strategy-specific preprocessing
+        # Strategy-specific preprocessing - optimized order for speed
         if self.strategy == DecodeStrategy.FAST:
-            # Fast path: minimal preprocessing
+            # Fast path: minimal preprocessing, only CLAHE
             if self.config.get('contrast_enhancement', True):
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
                 enhanced = clahe.apply(gray)
                 preprocessed_images.append((enhanced, 'clahe'))
+            
+            # Skip overexposure compensation in FAST mode for speed
+            # Skip print gain correction in FAST mode for speed
                 
         elif self.strategy == DecodeStrategy.BALANCED:
+            # Overexposure and glare compensation (applied early in pipeline)
+            if self.compensate_overexposure or self.glare_reduction:
+                compensated = self._compensate_overexposure_and_glare(gray)
+                if compensated is not None:
+                    preprocessed_images.append((compensated, 'overexposure_compensated'))
+            
+            # Print gain correction for improved contrast in printed codes
+            if self.print_gain_correction:
+                gain_corrected = self._apply_print_gain_correction(gray)
+                if gain_corrected is not None:
+                    preprocessed_images.append((gain_corrected, 'print_gain_corrected'))
+            
             # Balanced: moderate preprocessing
             if self.config.get('contrast_enhancement', True):
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -219,6 +217,24 @@ class DataMatrixDecoder:
             self._add_binarized_versions(gray, preprocessed_images)
             
         elif self.strategy in [DecodeStrategy.ACCURATE, DecodeStrategy.ULTRA_ACCURATE]:
+            # Overexposure and glare compensation (applied early in pipeline)
+            if self.compensate_overexposure or self.glare_reduction:
+                compensated = self._compensate_overexposure_and_glare(gray)
+                if compensated is not None:
+                    preprocessed_images.append((compensated, 'overexposure_compensated'))
+            
+            # Print gain correction for improved contrast in printed codes
+            if self.print_gain_correction:
+                gain_corrected = self._apply_print_gain_correction(gray)
+                if gain_corrected is not None:
+                    preprocessed_images.append((gain_corrected, 'print_gain_corrected'))
+                
+                # Also apply to compensated image if available
+                if self.compensate_overexposure and len(preprocessed_images) > 1:
+                    gain_on_compensated = self._apply_print_gain_correction(compensated)
+                    if gain_on_compensated is not None:
+                        preprocessed_images.append((gain_on_compensated, 'compensated_gain_corrected'))
+            
             # Accurate: extensive preprocessing
             if self.config.get('contrast_enhancement', True):
                 clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
@@ -607,13 +623,15 @@ class DataMatrixDecoder:
         """
         Detect and decode DataMatrix codes in the image.
         
+        Optimized for high-speed detection with minimal latency.
+        
         Args:
             image: Input image (grayscale or BGR)
             
         Returns:
             List of DataMatrixResult objects
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         results = []
         seen_data = set()  # Avoid duplicates
         
@@ -621,23 +639,27 @@ class DataMatrixDecoder:
         img_height, img_width = image.shape[:2]
         
         # Build image pyramid for multi-scale detection
+        # Optimized: fewer levels for faster processing
         pyramid = self._build_image_pyramid(image)
         
         # Process each scale level
         for scale_idx, (scaled_image, scale_factor) in enumerate(pyramid):
+            # Early exit for FAST strategy after first scale
+            if scale_idx >= 1 and self.strategy == DecodeStrategy.FAST:
+                break
             if scale_idx >= self.pyramid_levels and self.strategy != DecodeStrategy.ULTRA_ACCURATE:
                 break
             
             # Preprocess image at this scale
             preprocessed_list = self.preprocess_image(scaled_image)
             
-            # Limit attempts based on strategy
+            # Limit attempts based on strategy - optimized for speed
             max_preprocessed = {
                 DecodeStrategy.FAST: 2,
-                DecodeStrategy.BALANCED: 5,
-                DecodeStrategy.ACCURATE: 10,
+                DecodeStrategy.BALANCED: 4,
+                DecodeStrategy.ACCURATE: 8,
                 DecodeStrategy.ULTRA_ACCURATE: len(preprocessed_list)
-            }.get(self.strategy, 5)
+            }.get(self.strategy, 4)
             
             # Try each preprocessed version
             for attempt_idx, (processed_img, prep_method) in enumerate(preprocessed_list):
@@ -648,11 +670,7 @@ class DataMatrixDecoder:
                     # Decode using pyzbar - note: DataMatrix is decoded as part of general barcode detection
                     # pyzbar doesn't have a specific DATAMATRIX symbol type in older versions
                     # We decode all symbols and filter results by type
-                    decoded_objects = pyzbar.decode(processed_img)
-                    
-                    # Filter for DataMatrix codes only
-                    decoded_objects = [obj for obj in decoded_objects 
-                                      if hasattr(obj, 'type') and obj.type == 'datamatrix']
+                    decoded_objects = pyzbar.decode(processed_img, symbols=[pyzbar.ZBarSymbol.DATAMATRIX])
                     
                     for obj in decoded_objects:
                         # Skip duplicates
@@ -668,14 +686,12 @@ class DataMatrixDecoder:
                             location = self._extract_location(obj, processed_img, scale_factor, 
                                                              img_width, img_height)
                             
-                            decode_time = (time.time() - start_time) * 1000
-                            
                             result = DataMatrixResult(
                                 data=data_str,
                                 confidence=confidence,
                                 location=location,
                                 timestamp=time.time(),
-                                decode_time_ms=decode_time,
+                                decode_time_ms=(time.perf_counter() - start_time) * 1000,
                                 image_width=img_width,
                                 image_height=img_height,
                                 preprocessing_applied=prep_method,
@@ -685,7 +701,8 @@ class DataMatrixDecoder:
                             results.append(result)
                             seen_data.add(data_str)
                             
-                            if not self.multiple_codes:
+                            # Fast exit on first good result
+                            if not self.multiple_codes and confidence > 0.85:
                                 return results
                     
                 except Exception as e:
@@ -696,7 +713,7 @@ class DataMatrixDecoder:
             if results and self.strategy == DecodeStrategy.FAST:
                 break
         
-        total_time = (time.time() - start_time) * 1000
+        total_time = (time.perf_counter() - start_time) * 1000
         logger.debug(f"Decoding completed in {total_time:.2f}ms, found {len(results)} codes")
         
         return results

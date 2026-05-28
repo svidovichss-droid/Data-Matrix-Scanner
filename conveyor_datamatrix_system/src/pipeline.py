@@ -217,40 +217,38 @@ class ProcessingPipeline:
         logger.info("Processing resumed")
     
     def _capture_loop(self) -> None:
-        """Continuous image capture loop"""
+        """Continuous image capture loop - optimized for minimal latency"""
         logger.debug("Capture loop started")
         
         while self.running:
             try:
-                # Capture frame
+                # Capture frame with minimal delay
                 frame = self.camera.capture()
                 
                 if frame.success:
                     with self.stats_lock:
                         self.stats['frames_captured'] += 1
                     
-                    # Add to buffer
+                    # Add to buffer (non-blocking, drops oldest if full)
                     self.frame_buffer.put(frame)
-                else:
-                    logger.warning(f"Frame capture failed: {frame.error_message}")
                 
-                # Small delay to prevent CPU spinning
-                time.sleep(0.001)
+                # Minimal delay for high-speed capture
+                time.sleep(0.0001)  # 0.1ms instead of 1ms
                 
             except Exception as e:
                 logger.error(f"Capture error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.01)
         
         logger.debug("Capture loop ended")
     
     def _worker_loop(self) -> None:
-        """Worker thread for processing frames"""
+        """Worker thread for processing frames - optimized for minimal latency"""
         logger.debug("Worker loop started")
         
         while self.running:
             try:
-                # Get frame from buffer
-                frame = self.frame_buffer.get(timeout=0.1)
+                # Get frame from buffer with short timeout
+                frame = self.frame_buffer.get(timeout=0.05)
                 
                 if frame is None:
                     continue
@@ -258,16 +256,16 @@ class ProcessingPipeline:
                 if self.pause_processing:
                     # Put frame back if processing is paused
                     self.frame_buffer.put(frame)
-                    time.sleep(0.01)
+                    time.sleep(0.001)  # Minimal delay when paused
                     continue
                 
-                # Process frame
-                start_time = time.time()
+                # Process frame with high-precision timer
+                start_time = time.perf_counter()
                 
                 try:
                     decode_results = self.decoder.decode(frame.image)
                     
-                    processing_time = (time.time() - start_time) * 1000
+                    processing_time = (time.perf_counter() - start_time) * 1000
                     
                     result = ProcessingResult(
                         frame_id=frame.frame_id,
@@ -283,11 +281,11 @@ class ProcessingPipeline:
                         self.stats['codes_found'] += len(decode_results)
                         self.stats['total_processing_time_ms'] += processing_time
                     
-                    # Put result in queue
+                    # Put result in queue with short timeout
                     try:
-                        self.result_queue.put(result, timeout=0.1)
+                        self.result_queue.put(result, timeout=0.05)
                     except queue.Full:
-                        logger.warning("Result queue full, dropping result")
+                        logger.debug("Result queue full, dropping result")
                     
                 except Exception as e:
                     logger.error(f"Processing error: {e}")
@@ -303,13 +301,13 @@ class ProcessingPipeline:
                     )
                     
                     try:
-                        self.result_queue.put(result, timeout=0.1)
+                        self.result_queue.put(result, timeout=0.05)
                     except queue.Full:
                         pass
                 
             except Exception as e:
                 logger.error(f"Worker error: {e}")
-                time.sleep(0.01)
+                time.sleep(0.001)  # Minimal delay on error
         
         logger.debug("Worker loop ended")
     
