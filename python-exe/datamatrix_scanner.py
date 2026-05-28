@@ -294,6 +294,12 @@ class App(tk.Tk):
         self._last_decoded_t  = 0.0
         self._decode_interval = 0.15     # сек между попытками декодирования
         self._scan_lock_ms    = 1500     # мс блокировки повтора одного и того же кода
+        
+        # Параметры камеры
+        self.brightness_var  = tk.IntVar(value=128)
+        self.contrast_var    = tk.IntVar(value=128)
+        self.exposure_var    = tk.IntVar(value=-6)
+        self.gain_var        = tk.IntVar(value=64)
 
         # Очереди (три независимых потока)
         self.display_q = queue.Queue(maxsize=1)
@@ -388,6 +394,24 @@ class App(tk.Tk):
                                    font=self.fn_head, cursor="hand2",
                                    command=self._toggle_scan, padx=8, pady=4)
         self.start_btn.pack(side="left", padx=6)
+
+        # Управление яркостью
+        bright_frame = tk.Frame(ctrl, bg=BG2)
+        bright_frame.pack(side="left", padx=10)
+        
+        tk.Label(bright_frame, text="Яркость:", bg=BG2, fg=FG2, font=self.fn_small).pack(side="top", anchor="w")
+        self.bright_scale = tk.Scale(bright_frame, from_=0, to=255, orient="horizontal",
+                                     variable=self.brightness_var, length=100,
+                                     bg=BG3, fg=FG, troughcolor=BG2,
+                                     highlightthickness=0, command=self._on_brightness_change)
+        self.bright_scale.pack(side="top")
+        
+        tk.Label(bright_frame, text="Контраст:", bg=BG2, fg=FG2, font=self.fn_small).pack(side="top", anchor="w")
+        self.contrast_scale = tk.Scale(bright_frame, from_=0, to=255, orient="horizontal",
+                                       variable=self.contrast_var, length=100,
+                                       bg=BG3, fg=FG, troughcolor=BG2,
+                                       highlightthickness=0, command=self._on_contrast_change)
+        self.contrast_scale.pack(side="top")
 
         self.status_lbl = tk.Label(ctrl, text="Инициализация...",
                                    bg=BG2, fg=FG2, font=self.fn_small)
@@ -584,6 +608,9 @@ class App(tk.Tk):
             cap.set(cv2.CAP_PROP_FPS,          60)
             cap.set(cv2.CAP_PROP_AUTOFOCUS,    1)
             cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+            # Применяем настройки яркости/контраста
+            cap.set(cv2.CAP_PROP_BRIGHTNESS, self.brightness_var.get())
+            cap.set(cv2.CAP_PROP_CONTRAST,   self.contrast_var.get())
             if not cap.isOpened():
                 self.status_lbl.config(text="Ошибка: камера не открывается")
                 return
@@ -596,6 +623,18 @@ class App(tk.Tk):
                 threading.Thread(target=self._square_only_loop, daemon=True).start()
         except Exception as e:
             self.status_lbl.config(text=f"Ошибка: {e}")
+
+    def _apply_camera_settings(self):
+        """Применяет текущие настройки яркости и контраста к камере"""
+        if self.cap and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, self.brightness_var.get())
+            self.cap.set(cv2.CAP_PROP_CONTRAST,   self.contrast_var.get())
+
+    def _on_brightness_change(self, val):
+        self._apply_camera_settings()
+
+    def _on_contrast_change(self, val):
+        self._apply_camera_settings()
 
     def _stop_camera(self):
         self.running = False
