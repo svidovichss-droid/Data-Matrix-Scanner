@@ -167,10 +167,17 @@ function analyzeImageData(canvas: HTMLCanvasElement, roi?: { x: number; y: numbe
     : 0;
 
   const symbolContrast = clamp01((maxGray - minGray) / 255);
-  const modulation = clamp01(1 - (Math.sqrt(darkVariance) + Math.sqrt(lightVariance)) / range);
+  
+  // Улучшенная формула для modulation с учётом локальных вариаций
+  const darkStdDev = Math.sqrt(darkVariance);
+  const lightStdDev = Math.sqrt(lightVariance);
+  const avgStdDev = (darkStdDev + lightStdDev) / 2;
+  const modulation = clamp01(1 - (avgStdDev / (range * 0.8)));
+  
+  // Улучшенный RM с более точным расчётом запаса
   const reflectanceMargin = clamp01(Math.min(
-    (lightMean - threshold) / Math.max(1, 255 - minGray),
-    (threshold - darkMean) / Math.max(1, maxGray - threshold)
+    (lightMean - threshold) / Math.max(1, lightMean - minGray),
+    (threshold - darkMean) / Math.max(1, maxGray - darkMean)
   ));
 
   const transitionRate = computeTransitionRate(grayValues, width, height, threshold);
@@ -178,7 +185,7 @@ function analyzeImageData(canvas: HTMLCanvasElement, roi?: { x: number; y: numbe
 
   const axialNonUniformity = computeAxialNonUniformity(grayValues, width, height, threshold);
   const gridNonUniformity = computeGridNonUniformity(grayValues, width, height);
-  const printGrowth = computePrintGrowth(darkPixels.length, lightPixels.length, pixels);
+  const printGrowth = computePrintGrowth(darkPixels.length, lightPixels.length, pixels, threshold, grayValues);
   const unusedErrorCorrection = clamp01(symbolContrast * modulation);
 
   return {
@@ -246,9 +253,37 @@ function computeGridNonUniformity(grayValues: number[], width: number, height: n
   return clamp01(1 - Math.sqrt(variance) / 255);
 }
 
-function computePrintGrowth(darkCount: number, lightCount: number, total: number): number {
-  const darkRatio = total === 0 ? 0 : darkCount / total;
-  return clamp01(1 - Math.min(1, Math.abs(darkRatio - 0.5) * 4));
+function computePrintGrowth(darkCount: number, lightCount: number, total: number, threshold: number, grayValues: number[]): number {
+  if (total === 0) return 0;
+  
+  // Более точный расчёт прироста печати через анализ границ
+  const darkRatio = darkCount / total;
+  const idealRatio = 0.5;
+  
+  // Вычисляем количество переходов тёмный/светлый
+  let edgeTransitions = 0;
+  let totalEdges = 0;
+  
+  for (let i = 0; i < grayValues.length - 1; i++) {
+    const currDark = grayValues[i] < threshold;
+    const nextDark = grayValues[i + 1] < threshold;
+    if (currDark !== nextDark) {
+      edgeTransitions++;
+    }
+    totalEdges++;
+  }
+  
+  // Print Growth влияет на соотношение тёмных/светлых областей
+  // Идеальное значение около 0.5, отклонение снижает оценку
+  const ratioDeviation = Math.abs(darkRatio - idealRatio);
+  
+  // Нормализуем: 0 отклонение = 1.0, максимальное отклонение = 0
+  const baseScore = 1 - Math.min(1, ratioDeviation * 3);
+  
+  // Учитываем чёткость границ (резкие границы = хороший print growth)
+  const edgeFactor = edgeTransitions > 0 ? Math.min(1, edgeTransitions / (totalEdges * 0.3)) : 0.5;
+  
+  return clamp01((baseScore + edgeFactor) / 2);
 }
 
 function metricToGrade(value: number, thresholds: [number, number, number, number]): Grade {

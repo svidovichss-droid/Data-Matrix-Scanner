@@ -135,6 +135,8 @@ export default function Scanner() {
   const [soundEnabled, setSoundEnabled]   = useState(true);
   const [activeTab, setActiveTab]         = useState<'scan' | 'history'>('scan');
   const [fps, setFps]                     = useState(0);
+  const [brightness, setBrightness]       = useState(100);
+  const [contrast, setContrast]           = useState(100);
 
   const fpsCounter = useRef({ frames: 0, last: Date.now() });
 
@@ -218,7 +220,12 @@ export default function Scanner() {
       if (video && canvas && video.readyState >= 2) {
         canvas.width  = video.videoWidth  || 640;
         canvas.height = video.videoHeight || 480;
-        canvas.getContext('2d')!.drawImage(video, 0, 0);
+        const ctx = canvas.getContext('2d')!;
+        
+        // Применяем яркость и контраст
+        ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`;
+        ctx.drawImage(video, 0, 0);
+        ctx.filter = 'none';
 
         const f = fpsCounter.current;
         f.frames++;
@@ -232,7 +239,7 @@ export default function Scanner() {
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-  }, []);
+  }, [brightness, contrast]);
 
   // ── Поток 2: декодирование (setInterval 150ms) ────────────────────────────
   // Аналог Python _decode_loop с _decode_interval = 0.15
@@ -478,6 +485,34 @@ export default function Scanner() {
             >
               {scanning ? 'Стоп' : 'Старт'}
             </button>
+          </div>
+
+          {/* Управление яркостью и контрастом */}
+          <div className="p-4 bg-card border-t border-border/50 space-y-3">
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-muted-foreground w-20">Яркость</label>
+              <input
+                type="range"
+                min="50"
+                max="150"
+                value={brightness}
+                onChange={(e) => setBrightness(Number(e.target.value))}
+                className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
+              />
+              <span className="text-xs font-mono w-12 text-right">{brightness}%</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-muted-foreground w-20">Контраст</label>
+              <input
+                type="range"
+                min="50"
+                max="150"
+                value={contrast}
+                onChange={(e) => setContrast(Number(e.target.value))}
+                className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
+              />
+              <span className="text-xs font-mono w-12 text-right">{contrast}%</span>
+            </div>
           </div>
 
           {cameraError && (
