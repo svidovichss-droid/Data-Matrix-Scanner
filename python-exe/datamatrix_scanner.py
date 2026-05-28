@@ -105,10 +105,31 @@ def worst_grade(grades) -> str:
     return "F"
 
 
-def analyze_frame(frame: np.ndarray) -> dict:
-    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+def analyze_frame(frame: np.ndarray, roi_box=None) -> dict:
+    """
+    Анализирует качество DataMatrix.
+    Если roi_box задан (x, y, w, h), анализ выполняется только внутри ROI.
+    """
+    # Вырезаем ROI если указан
+    if roi_box is not None:
+        x, y, w, h = roi_box
+        h_frame, w_frame = frame.shape[:2]
+        x = max(0, min(x, w_frame - 1))
+        y = max(0, min(y, h_frame - 1))
+        w = max(1, min(w, w_frame - x))
+        h = max(1, min(h, h_frame - y))
+        frame_roi = frame[y:y+h, x:x+w]
+    else:
+        frame_roi = frame
+    
+    gray  = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
     h, w  = gray.shape
     total = h * w
+    
+    if total == 0:
+        # Пустой ROI
+        params = {k: {"value": 0.0, "grade": "F"} for k, _, _ in PARAMS_META}
+        return {"params": params, "overall": "F", "score": 0.0}
 
     Rmax = float(gray.max())
     Rmin = float(gray.min())
@@ -125,10 +146,17 @@ def analyze_frame(frame: np.ndarray) -> dict:
     ls = float(light.std())  if len(light) > 1 else 0.0
     mod = max(0.0, 1.0 - (ds + ls) / rng)
 
-    rm = min(
-        (lm - thr) / max(lm - Rmin, 1),
-        (thr - dm) / max(Rmax - dm,  1),
-    )
+    # Улучшенный расчёт RM с учётом реального распределения яркостей
+    rm_light = (lm - thr) / max(lm - Rmin, 1e-6) if lm > Rmin else 0.0
+    rm_dark  = (thr - dm) / max(Rmax - dm, 1e-6) if Rmax > dm else 0.0
+    rm = min(rm_light, rm_dark)
+    
+    # Дополнительная коррекция RM для случаев с неравномерным освещением
+    if len(dark) > 0 and len(light) > 0:
+        dark_ratio = len(dark) / total
+        # Если тёмных пикселей слишком мало или слишком много, снижаем RM
+        if dark_ratio < 0.2 or dark_ratio > 0.8:
+            rm *= 0.7
 
     edges = 0
     for row in range(min(4, h)):
@@ -147,7 +175,11 @@ def analyze_frame(frame: np.ndarray) -> dict:
     gnu = max(0.0, 1.0 - float(np.std(bm)) / 255.0) if len(bm) > 1 else 1.0
 
     uec = min(1.0, sc * mod)
-    pg  = max(0.0, 1.0 - min(1.0, abs(len(dark) / total - 0.5) * 4.0))
+    
+    # Улучшенный расчёт PG с учётом идеального соотношения чёрного и белого
+    ideal_ratio = 0.5  # Идеально 50% чёрных и 50% белых модулей
+    actual_ratio = len(dark) / total
+    pg = max(0.0, 1.0 - min(1.0, abs(actual_ratio - ideal_ratio) * 3.0))
 
     raw = {"SC": sc, "MOD": mod, "RM": rm, "FPD": fpd,
            "ANU": anu, "GNU": gnu, "UEC": uec, "PG": pg}
@@ -228,6 +260,100 @@ def try_decode_dmtx(img_bgr: np.ndarray):
             except Exception:
                 pass
     return None
+
+
+def find_l_pattern(frame: np.ndarray):
+    """
+    Обнаружение L-паттерна (finder pattern) DataMatrix с любой стороны.
+    L-паттерн состоит из двух перпендикулярных тёмных линий (стороны "L").
+    Возвращает (x, y, w, h) ограничивающего прямоугольника или None.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    
+    # Бинаризация
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Морфологические операции для усиления линий
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(binary, kernel, iterations=2)
+    eroded = cv2.erode(dilated, kernel, iterations=1)
+    
+    # Поиск контуров
+    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    candidates = []
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 500 or area > w * h * 0.5:
+            continue
+        
+        # Аппроксимация полигоном
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        
+        # Ищем четырёхугольники (квадраты/прямоугольники)
+        if len(approx) == 4:
+            x, y, bw, bh = cv2.boundingRect(approx)
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            
+            # DataMatrix обычно квадратный или близкий к квадрату
+            if aspect < 2.5:
+                # Проверяем наличие L-паттерна внутри
+                roi = gray[y:y+bh, x:x+bw]
+                if _has_l_pattern(roi):
+                    candidates.append((area, x, y, bw, bh))
+    
+    if not candidates:
+        return None
+    
+    # Возвращаем наибольший кандидат
+    candidates.sort(reverse=True)
+    _, x, y, bw, bh = candidates[0]
+    
+    # Добавляем небольшой отступ
+    pad = max(4, min(bw, bh) // 10)
+    x = max(0, x - pad)
+    y = max(0, y - pad)
+    bw = min(w - x, bw + 2*pad)
+    bh = min(h - y, bh + 2*pad)
+    
+    return x, y, bw, bh
+
+
+def _has_l_pattern(roi: np.ndarray) -> bool:
+    """
+    Проверка наличия L-паттерна в ROI.
+    L-паттерн: две перпендикулярные тёмные линии по краям (слева и снизу, 
+    или слева и сверху, или справа и снизу, или справа и сверху).
+    """
+    if roi.size == 0:
+        return False
+    
+    h, w = roi.shape
+    _, binary = cv2.threshold(roi, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Проверяем все 4 возможных ориентации L-паттерна
+    # Левая и нижняя стороны
+    left_edge = binary[:, 0:max(1, w//10)].mean()
+    bottom_edge = binary[max(h-h//10, 0):h, :].mean()
+    top_edge = binary[0:max(1, h//10), :].mean()
+    right_edge = binary[:, max(0, w-w//10):].mean()
+    
+    # L-паттерн должен иметь две смежные тёмные стороны с высоким заполнением
+    orientations = [
+        (left_edge, bottom_edge),   # L нормальный
+        (left_edge, top_edge),      # L перевёрнутый вверх
+        (right_edge, bottom_edge),  # L зеркальный
+        (right_edge, top_edge),     # L полный переворот
+    ]
+    
+    for edge1, edge2 in orientations:
+        if edge1 > 0.6 and edge2 > 0.6:
+            return True
+    
+    return False
 
 
 def find_square_roi(frame: np.ndarray):
@@ -710,10 +836,27 @@ class App(tk.Tk):
                     text, rect = result
                     box_in_frame = (ox + rect[0], oy + rect[1], rect[2], rect[3])
 
-            # Шаг 3 — fallback: поиск квадрата
+            # Шаг 3 — поиск L-паттерна (новый метод)
+            lpattern_found = False
+            l_box = None
+            if text is None:
+                lp = find_l_pattern(frame)
+                if lp is not None:
+                    lx, ly, lw, lh = lp
+                    lp_roi = frame[ly:ly+lh, lx:lx+lw]
+                    result = try_decode_dmtx(lp_roi)
+                    if result:
+                        text, rect = result
+                        box_in_frame = (lx + rect[0], ly + rect[1], rect[2], rect[3])
+                    else:
+                        lpattern_found = True
+                        l_box = lp
+                        box_in_frame = lp
+
+            # Шаг 4 — fallback: поиск квадрата
             square_found = False
             sq_box       = None
-            if text is None:
+            if text is None and not lpattern_found:
                 sq = find_square_roi(frame)
                 if sq is not None:
                     sx, sy, sw, sh = sq
@@ -760,9 +903,10 @@ class App(tk.Tk):
                     bx = max(0, bx); by = max(0, by)
                     bw = min(fw - bx, bw); bh = min(fh - by, bh)
                     analysis_roi = frame[by:by+bh, bx:bx+bw] if bw > 4 and bh > 4 else frame
+                    res = analyze_frame(frame, roi_box=box_in_frame)
                 else:
                     analysis_roi = frame
-                res = analyze_frame(analysis_roi)
+                    res = analyze_frame(frame)
             ms = (time.perf_counter() - t0) * 1000.0
 
             # Обновляем цвет оверлея по оценке
@@ -793,8 +937,17 @@ class App(tk.Tk):
             now = time.time()
             if now - self._last_decoded_t < self._decode_interval:
                 continue
-            sq = find_square_roi(frame)
-            if not sq:
+            
+            # Сначала пробуем L-паттерн
+            box = find_l_pattern(frame)
+            method_used = "l_pattern"
+            
+            # Если не нашли, пробуем квадрат
+            if not box:
+                box = find_square_roi(frame)
+                method_used = "square"
+            
+            if not box:
                 continue
             label = "[нераспознан]"
             if label == self._last_decoded and now - self._last_decoded_t < (self._scan_lock_ms / 1000.0):
@@ -803,7 +956,7 @@ class App(tk.Tk):
             self._last_decoded_t = now
             self.after(self._scan_lock_ms, self._reset_scan_lock)
             with self._overlay_lock:
-                self._overlay = {"box": sq, "t": time.time(), "ok": False, "grade": "F"}
+                self._overlay = {"box": box, "t": time.time(), "ok": False, "grade": "F"}
             params = {k: {"value": 0.0, "grade": "F"} for k, _, _ in PARAMS_META}
             res    = {"params": params, "overall": "F", "score": 0.0}
             if self.sound_on:
