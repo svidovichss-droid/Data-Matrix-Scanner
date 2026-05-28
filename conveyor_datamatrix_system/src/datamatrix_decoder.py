@@ -78,6 +78,8 @@ class DataMatrixDecoder:
     - Adaptive confidence scoring
     - Motion deblurring support
     - ROI-based processing
+    - Overexposure and glare compensation
+    - Print gain correction
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -100,7 +102,22 @@ class DataMatrixDecoder:
         self.orientation_correction = config.get('orientation_correction', True)
         self.super_resolution = config.get('super_resolution', False)
         
+        # Overexposure and glare handling
+        self.compensate_overexposure = config.get('compensate_overexposure', True)
+        self.glare_reduction = config.get('glare_reduction', True)
+        self.print_gain_correction = config.get('print_gain_correction', True)
+        self.highlight_recovery = config.get('highlight_recovery', 'tone_mapping')  # 'tone_mapping', 'inpaint', 'both'
+        self.max_brightness_percentile = config.get('max_brightness_percentile', 95)
+        self.glare_threshold = config.get('glare_threshold', 250)  # Pixel value threshold for glare
+        self.glare_max_area_percent = config.get('glare_max_area_percent', 15)  # Max % of image that can be glare
+        
         logger.info(f"DataMatrixDecoder initialized with {self.backend} backend, strategy: {self.strategy.value}")
+        if self.compensate_overexposure:
+            logger.info("Overexposure compensation enabled")
+        if self.glare_reduction:
+            logger.info(f"Glare reduction enabled (threshold: {self.glare_threshold})")
+        if self.print_gain_correction:
+            logger.info("Print gain correction enabled")
     
     def _apply_roi(self, image: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
         """Apply region of interest if configured"""
@@ -143,6 +160,8 @@ class DataMatrixDecoder:
         """
         Apply preprocessing to enhance DataMatrix code visibility.
         Returns multiple preprocessed versions with method labels for robust detection.
+        
+        Enhanced with overexposure compensation and glare reduction for bright camera conditions.
         """
         preprocessed_images = []
         
@@ -157,6 +176,24 @@ class DataMatrixDecoder:
         
         # Base preprocessing
         preprocessed_images.append((gray, 'original'))
+        
+        # Overexposure and glare compensation (applied early in pipeline)
+        if self.compensate_overexposure or self.glare_reduction:
+            compensated = self._compensate_overexposure_and_glare(gray)
+            if compensated is not None:
+                preprocessed_images.append((compensated, 'overexposure_compensated'))
+        
+        # Print gain correction for improved contrast in printed codes
+        if self.print_gain_correction:
+            gain_corrected = self._apply_print_gain_correction(gray)
+            if gain_corrected is not None:
+                preprocessed_images.append((gain_corrected, 'print_gain_corrected'))
+            
+            # Also apply to compensated image if available
+            if self.compensate_overexposure and len(preprocessed_images) > 1:
+                gain_on_compensated = self._apply_print_gain_correction(compensated)
+                if gain_on_compensated is not None:
+                    preprocessed_images.append((gain_on_compensated, 'compensated_gain_corrected'))
         
         # Strategy-specific preprocessing
         if self.strategy == DecodeStrategy.FAST:
@@ -352,6 +389,197 @@ class DataMatrixDecoder:
         except Exception as e:
             logger.debug(f"Super-resolution not available: {e}")
             return None
+    
+    def _compensate_overexposure_and_glare(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Compensate for overexposure and glare in bright camera conditions.
+        
+        Techniques used:
+        - Highlight recovery through tone mapping
+        - Glare detection and reduction
+        - Adaptive histogram equalization for recovered regions
+        - Inpainting for severe glare spots
+        
+        Args:
+            image: Input grayscale image
+            
+        Returns:
+            Compensated image or None if processing fails
+        """
+        try:
+            img_float = image.astype(np.float32) / 255.0
+            
+            # Detect overexposed regions (pixels above threshold)
+            overexposed_mask = image > self.glare_threshold
+            overexposed_ratio = np.sum(overexposed_mask) / image.size * 100
+            
+            # Skip if too much of the image is overexposed (likely invalid)
+            if overexposed_ratio > self.glare_max_area_percent:
+                logger.debug(f"Too much overexposure ({overexposed_ratio:.1f}%), skipping compensation")
+                return image
+            
+            # Skip if no overexposure detected
+            if overexposed_ratio < 0.1:
+                return image
+            
+            logger.debug(f"Compensating overexposure ({overexposed_ratio:.1f}% of image)")
+            
+            # Method 1: Tone mapping for highlight recovery
+            if self.highlight_recovery in ['tone_mapping', 'both']:
+                # Apply gamma correction to compress highlights
+                gamma = 0.7  # Compress highlights
+                tone_mapped = np.power(img_float, 1.0 / gamma)
+                
+                # Blend tone mapped with original based on exposure level
+                blend_weight = np.clip((image - 200) / 55.0, 0, 1)  # More blend in highlights
+                blended = img_float * (1 - blend_weight) + tone_mapped * blend_weight
+                
+                img_float = blended
+            
+            # Method 2: Inpainting for severe glare spots
+            if self.highlight_recovery in ['inpaint', 'both'] and overexposed_ratio > 1.0:
+                # Create inpainting mask (only severe glare)
+                severe_glare_mask = (image > 254).astype(np.uint8) * 255
+                
+                # Dilate mask slightly to cover glare halo
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                dilated_mask = cv2.dilate(severe_glare_mask, kernel, iterations=2)
+                
+                # Inpaint using telea method
+                if np.sum(dilated_mask) > 0:
+                    img_uint8 = (img_float * 255).astype(np.uint8)
+                    inpainted = cv2.inpaint(img_uint8, dilated_mask, inpaintRadius=3, 
+                                           flags=cv2.INPAINT_TELEA)
+                    img_float = inpainted.astype(np.float32) / 255.0
+            
+            # Apply CLAHE to enhance contrast in recovered regions
+            img_enhanced = (img_float * 255).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(16, 16))
+            result = clahe.apply(img_enhanced)
+            
+            # Reduce glare by suppressing specular reflections
+            if self.glare_reduction:
+                result = self._suppress_glare(result, overexposed_mask)
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Overexposure compensation failed: {e}")
+            return image
+    
+    def _suppress_glare(self, image: np.ndarray, glare_mask: np.ndarray) -> np.ndarray:
+        """
+        Suppress glare and specular reflections in the image.
+        
+        Uses morphological operations and local intensity normalization
+        to reduce the impact of glare on DataMatrix decoding.
+        
+        Args:
+            image: Input grayscale image
+            glare_mask: Boolean mask indicating glare regions
+            
+        Returns:
+            Image with reduced glare
+        """
+        try:
+            # Convert boolean mask to uint8
+            mask_uint8 = glare_mask.astype(np.uint8) * 255
+            
+            # Find contours of glare regions
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            result = image.copy()
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 50:  # Skip very small glare spots
+                    continue
+                
+                # Get bounding box of glare region
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Expand ROI slightly
+                pad = 5
+                x1, y1 = max(0, x - pad), max(0, y - pad)
+                x2, y2 = min(image.shape[1], x + w + pad), min(image.shape[0], y + h + pad)
+                
+                roi = result[y1:y2, x1:x2]
+                
+                # Apply local histogram equalization to ROI
+                if roi.size > 0:
+                    roi_eq = cv2.equalizeHist(roi)
+                    
+                    # Blend with original to avoid harsh transitions
+                    alpha = 0.7
+                    result[y1:y2, x1:x2] = cv2.addWeighted(roi, alpha, roi_eq, 1 - alpha, 0)
+            
+            # Apply mild Gaussian blur to smooth glare transitions
+            result = cv2.GaussianBlur(result, (3, 3), 0.5)
+            
+            return result
+            
+        except Exception as e:
+            logger.debug(f"Glare suppression failed: {e}")
+            return image
+    
+    def _apply_print_gain_correction(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Apply print gain correction to improve contrast in printed DataMatrix codes.
+        
+        Print gain refers to the phenomenon where printed dots spread,
+        reducing contrast between bars and spaces. This correction:
+        - Enhances edge sharpness
+        - Compensates for dot gain
+        - Improves binarization quality
+        
+        Args:
+            image: Input grayscale image
+            
+        Returns:
+            Gain-corrected image or None if processing fails
+        """
+        try:
+            # Calculate image statistics
+            mean_val = np.mean(image)
+            std_val = np.std(image)
+            
+            # Skip if image has very low contrast (likely uniform)
+            if std_val < 10:
+                return image
+            
+            # Apply unsharp masking to enhance edges
+            gaussian = cv2.GaussianBlur(image, (9, 9), 2.0)
+            unsharp_mask = cv2.addWeighted(image, 1.5, gaussian, -0.5, 0)
+            
+            # Apply adaptive contrast enhancement based on local statistics
+            # This helps with varying print quality across the code
+            img_float = unsharp_mask.astype(np.float32)
+            
+            # Local contrast normalization
+            kernel_size = 15
+            local_mean = cv2.blur(img_float, (kernel_size, kernel_size))
+            local_std = cv2.blur(img_float ** 2, (kernel_size, kernel_size)) - local_mean ** 2
+            local_std = np.sqrt(np.maximum(local_std, 1.0))
+            
+            # Normalize local contrast
+            normalized = (img_float - local_mean) / local_std
+            normalized = normalized * std_val + mean_val
+            
+            # Clip to valid range
+            result = np.clip(normalized, 0, 255).astype(np.uint8)
+            
+            # Apply morphological gradient to sharpen edges further
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            gradient = cv2.morphologyEx(result, cv2.MORPH_GRADIENT, kernel)
+            
+            # Blend gradient with original for edge enhancement
+            result = cv2.addWeighted(result, 0.85, gradient, 0.15, 0)
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Print gain correction failed: {e}")
+            return image
     
     def _build_image_pyramid(self, image: np.ndarray) -> List[Tuple[np.ndarray, float]]:
         """Build image pyramid for multi-scale detection"""
@@ -642,7 +870,60 @@ def find_datamatrix_accurate(image: np.ndarray,
         'binarization': 'all',
         'enable_deblur': enable_deblur,
         'orientation_correction': True,
-        'super_resolution': False
+        'super_resolution': False,
+        # Overexposure and glare handling
+        'compensate_overexposure': True,
+        'glare_reduction': True,
+        'print_gain_correction': True,
+        'highlight_recovery': 'both',
+        'glare_threshold': 245,
+        'glare_max_area_percent': 20
+    })
+    
+    return decoder.decode(image)
+
+
+def find_datamatrix_bright_conditions(image: np.ndarray,
+                                      aggressive_compensation: bool = True) -> List[DataMatrixResult]:
+    """
+    Specialized DataMatrix detection for overly bright camera conditions.
+    Optimized for scenarios with overexposure, glare, and print gain issues.
+    
+    Args:
+        image: Input image
+        aggressive_compensation: Use aggressive overexposure compensation
+        
+    Returns:
+        List of DataMatrixResult objects
+    """
+    glare_threshold = 240 if aggressive_compensation else 250
+    max_glare_area = 25 if aggressive_compensation else 15
+    
+    decoder = DataMatrixDecoder({
+        'min_size': 20,
+        'max_size': 500,
+        'strategy': 'ultra_accurate',
+        'backend': 'zbar',
+        'multiple_codes': True,
+        'confidence_threshold': 0.45,
+        'max_attempts': 15,
+        'use_pyramid': True,
+        'pyramid_levels': 5,
+        'contrast_enhancement': True,
+        'denoise': True,
+        'denoise_strength': 8,
+        'binarization': 'all',
+        'enable_deblur': True,
+        'deblur_kernel_size': 7,
+        'orientation_correction': True,
+        # Aggressive overexposure handling
+        'compensate_overexposure': True,
+        'glare_reduction': True,
+        'print_gain_correction': True,
+        'highlight_recovery': 'both',
+        'glare_threshold': glare_threshold,
+        'glare_max_area_percent': max_glare_area,
+        'max_brightness_percentile': 98
     })
     
     return decoder.decode(image)
