@@ -146,17 +146,18 @@ def analyze_frame(frame: np.ndarray, roi_box=None) -> dict:
     ls = float(light.std())  if len(light) > 1 else 0.0
     mod = max(0.0, 1.0 - (ds + ls) / rng)
 
-    # Улучшенный расчёт RM с учётом реального распределения яркостей
-    rm_light = (lm - thr) / max(lm - Rmin, 1e-6) if lm > Rmin else 0.0
-    rm_dark  = (thr - dm) / max(Rmax - dm, 1e-6) if Rmax > dm else 0.0
-    rm = min(rm_light, rm_dark)
+    # Улучшенный расчёт RM по ГОСТ Р 57302-2016 / ISO/IEC 15415
+    # RM = min((Rmax - thr) / (Rmax - Rmin), (thr - Rmin) / (Rmax - Rmin))
+    # где thr - пороговое значение между тёмными и светлыми модулями
+    if rng > 1e-6:
+        rm_upper = (Rmax - thr) / rng  # запас для светлых модулей
+        rm_lower = (thr - Rmin) / rng  # запас для тёмных модулей
+        rm = min(rm_upper, rm_lower)
+    else:
+        rm = 0.0
     
-    # Дополнительная коррекция RM для случаев с неравномерным освещением
-    if len(dark) > 0 and len(light) > 0:
-        dark_ratio = len(dark) / total
-        # Если тёмных пикселей слишком мало или слишком много, снижаем RM
-        if dark_ratio < 0.2 or dark_ratio > 0.8:
-            rm *= 0.7
+    # Нормализуем RM в диапазон [0, 1]
+    rm = max(0.0, min(1.0, rm * 2.0))  # умножаем на 2, т.к. идеальный RM = 0.5 даёт оценку 1.0
 
     edges = 0
     for row in range(min(4, h)):
@@ -176,10 +177,20 @@ def analyze_frame(frame: np.ndarray, roi_box=None) -> dict:
 
     uec = min(1.0, sc * mod)
     
-    # Улучшенный расчёт PG с учётом идеального соотношения чёрного и белого
+    # Улучшенный расчёт PG по ГОСТ Р 57302-2016 / ISO/IEC 15415
+    # PG оценивает отклонение фактического соотношения чёрного/белого от идеального
+    # Идеальное соотношение для DataMatrix: ~50% чёрных и ~50% белых модулей
+    # Но с учётом L-паттерна (сплошные тёмные линии) допустимо отклонение
     ideal_ratio = 0.5  # Идеально 50% чёрных и 50% белых модулей
     actual_ratio = len(dark) / total
-    pg = max(0.0, 1.0 - min(1.0, abs(actual_ratio - ideal_ratio) * 3.0))
+    
+    # Более мягкая формула PG: допускаем отклонение до ±25% без снижения оценки
+    deviation = abs(actual_ratio - ideal_ratio)
+    if deviation <= 0.25:
+        pg = 1.0
+    else:
+        # Линейное снижение от 1.0 до 0.0 при отклонении от 25% до 50%
+        pg = max(0.0, 1.0 - (deviation - 0.25) / 0.25)
 
     raw = {"SC": sc, "MOD": mod, "RM": rm, "FPD": fpd,
            "ANU": anu, "GNU": gnu, "UEC": uec, "PG": pg}
@@ -271,10 +282,10 @@ def find_l_pattern(frame: np.ndarray):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     
-    # Бинаризация
+    # Бинаризация с инверсией (тёмные объекты = белые на бинарном)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Морфологические операции для усиления линий
+    # Морфологические операции для усиления связности линий
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     dilated = cv2.dilate(binary, kernel, iterations=2)
     eroded = cv2.erode(dilated, kernel, iterations=1)
@@ -325,32 +336,61 @@ def find_l_pattern(frame: np.ndarray):
 def _has_l_pattern(roi: np.ndarray) -> bool:
     """
     Проверка наличия L-паттерна в ROI.
-    L-паттерн: две перпендикулярные тёмные линии по краям (слева и снизу, 
-    или слева и сверху, или справа и снизу, или справа и сверху).
+    L-паттерн DataMatrix: две перпендикулярные сплошные тёмные линии,
+    образующие угол 90 градусов. Поддерживает все 4 ориентации.
     """
     if roi.size == 0:
         return False
     
     h, w = roi.shape
+    if h < 10 or w < 10:
+        return False
+    
+    # Бинаризация: тёмные = 1, светлые = 0
     _, binary = cv2.threshold(roi, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary = binary.astype(np.uint8)
     
-    # Проверяем все 4 возможных ориентации L-паттерна
-    # Левая и нижняя стороны
-    left_edge = binary[:, 0:max(1, w//10)].mean()
-    bottom_edge = binary[max(h-h//10, 0):h, :].mean()
-    top_edge = binary[0:max(1, h//10), :].mean()
-    right_edge = binary[:, max(0, w-w//10):].mean()
+    # Проверяем все 4 ориентации L-паттерна
+    # Для каждой ориентации проверяем наличие двух перпендикулярных линий
     
-    # L-паттерн должен иметь две смежные тёмные стороны с высоким заполнением
+    # Определяем толщину краевой полосы для анализа (15% от размера)
+    edge_w = max(2, int(w * 0.15))
+    edge_h = max(2, int(h * 0.15))
+    
+    # Вырезаем краевые полосы
+    left_strip   = binary[:, :edge_w]
+    right_strip  = binary[:, w-edge_w:]
+    top_strip    = binary[:edge_h, :]
+    bottom_strip = binary[h-edge_h:, :]
+    
+    # Функция проверки сплошности линии
+    def is_solid_line(strip, axis):
+        """Проверяет, является ли полоса сплошной тёмной линией"""
+        if axis == 'horizontal':
+            # Для горизонтальной полосы (top/bottom): проверяем каждую колонку
+            col_sums = strip.sum(axis=0)  # сумма по вертикали для каждой колонки
+            max_col_sum = strip.shape[0]  # максимальная возможная сумма
+            # Линия считается сплошной, если >= 70% пикселей тёмные в большинстве колонок
+            solid_cols = np.sum(col_sums >= max_col_sum * 0.7)
+            return solid_cols >= strip.shape[1] * 0.7
+        else:
+            # Для вертикальной полосы (left/right): проверяем каждую строку
+            row_sums = strip.sum(axis=1)  # сумма по горизонтали для каждой строки
+            max_row_sum = strip.shape[1]  # максимальная возможная сумма
+            # Линия считается сплошной, если >= 70% пикселей тёмные в большинстве строк
+            solid_rows = np.sum(row_sums >= max_row_sum * 0.7)
+            return solid_rows >= strip.shape[0] * 0.7
+    
+    # Проверяем 4 возможные ориентации L-паттерна
     orientations = [
-        (left_edge, bottom_edge),   # L нормальный
-        (left_edge, top_edge),      # L перевёрнутый вверх
-        (right_edge, bottom_edge),  # L зеркальный
-        (right_edge, top_edge),     # L полный переворот
+        (left_strip, bottom_strip, 'vertical', 'horizontal'),    # L нормальный (левый нижний угол)
+        (left_strip, top_strip, 'vertical', 'horizontal'),       # L перевёрнутый (левый верхний угол)
+        (right_strip, bottom_strip, 'vertical', 'horizontal'),   # L зеркальный (правый нижний угол)
+        (right_strip, top_strip, 'vertical', 'horizontal'),      # L полный переворот (правый верхний угол)
     ]
     
-    for edge1, edge2 in orientations:
-        if edge1 > 0.6 and edge2 > 0.6:
+    for strip1, strip2, axis1, axis2 in orientations:
+        if is_solid_line(strip1, axis1) and is_solid_line(strip2, axis2):
             return True
     
     return False
