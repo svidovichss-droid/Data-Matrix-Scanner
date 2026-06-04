@@ -458,7 +458,7 @@ class App(tk.Tk):
         self.history         = []
         self._last_decoded    = ""
         self._last_decoded_t  = 0.0
-        self._decode_interval = 0.15     # сек между попытками декодирования
+        self._decode_interval = 0.03     # сек между попытками декодирования
         self._scan_lock_ms    = 1500     # мс блокировки повтора одного и того же кода
         
         # Параметры камеры
