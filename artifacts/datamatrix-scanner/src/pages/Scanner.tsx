@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { BrowserDatamatrixCodeReader } from '@zxing/browser';
-import { DecodeHintType, Result, ResultPoint } from '@zxing/library';
-import { analyzeQuality, QualityResult, gradeColor, gradeLabel, Grade } from '@/lib/qualityAnalysis';
+import { DecodeHintType, ResultPoint } from '@zxing/library';
+import { analyzeQuality, QualityResult } from '@/lib/qualityAnalysis';
 import { playGradeSound } from '@/lib/audioFeedback';
 import GradeDisplay from '@/components/GradeDisplay';
 import ParameterTable from '@/components/ParameterTable';
@@ -13,11 +13,16 @@ export interface ScanRecord {
   result: QualityResult;
 }
 
-// ── Параметры — точное соответствие Python-проекту ───────────────────────────
+// ── Константы — соответствуют Python-проекту ──────────────────────────────────
 const DECODE_INTERVAL_MS = 150;   // _decode_interval = 0.15 сек
 const SCAN_LOCK_MS       = 1500;  // _scan_lock_ms
 
-// ── Препроцессинг кадра ───────────────────────────────────────────────────────
+// ── Определение GoPro ─────────────────────────────────────────────────────────
+function isGoPro(label: string): boolean {
+  return /gopro|hero\s*\d+/i.test(label);
+}
+
+// ── Препроцессинг ─────────────────────────────────────────────────────────────
 function makeGray(data: Uint8ClampedArray): Float32Array {
   const n = data.length / 4;
   const g = new Float32Array(n);
@@ -27,39 +32,27 @@ function makeGray(data: Uint8ClampedArray): Float32Array {
 }
 
 function stretchContrast(data: Uint8ClampedArray, gray: Float32Array): void {
-  let minV = 255, maxV = 0;
+  let lo = 255, hi = 0;
+  for (const v of gray) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const range = hi - lo || 1;
   for (let i = 0; i < gray.length; i++) {
-    if (gray[i] < minV) minV = gray[i];
-    if (gray[i] > maxV) maxV = gray[i];
-  }
-  const range = maxV - minV || 1;
-  for (let i = 0; i < gray.length; i++) {
-    const v = Math.round((gray[i] - minV) / range * 255);
-    data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
+    const v = Math.round((gray[i] - lo) / range * 255);
+    data[i*4] = v; data[i*4+1] = v; data[i*4+2] = v; data[i*4+3] = 255;
   }
 }
 
-function applyGray(data: Uint8ClampedArray, gray: Float32Array): void {
-  for (let i = 0; i < gray.length; i++) {
-    const v = Math.round(Math.max(0, Math.min(255, gray[i])));
-    data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
-  }
-}
-
-function sharpen(gray: Float32Array, w: number, h: number): Float32Array {
-  const out = new Float32Array(gray.length);
+function sharpenGray(gray: Float32Array, w: number, h: number, data: Uint8ClampedArray): void {
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const i = y * w + x;
-      out[i] = Math.max(0, Math.min(255,
-        5 * gray[i] - gray[(y-1)*w+x] - gray[(y+1)*w+x] - gray[y*w+x-1] - gray[y*w+x+1]
+      const v = Math.max(0, Math.min(255,
+        5*gray[i] - gray[(y-1)*w+x] - gray[(y+1)*w+x] - gray[y*w+x-1] - gray[y*w+x+1]
       ));
+      data[i*4] = v; data[i*4+1] = v; data[i*4+2] = v; data[i*4+3] = 255;
     }
   }
-  return out;
 }
 
-/** Создать canvas с применённым препроцессингом */
 function makeCanvas(data: Uint8ClampedArray, w: number, h: number): HTMLCanvasElement {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
@@ -69,17 +62,13 @@ function makeCanvas(data: Uint8ClampedArray, w: number, h: number): HTMLCanvasEl
   return c;
 }
 
-/** Вырезать прямоугольную область из canvas */
-function cropCanvas(
-  src: HTMLCanvasElement, x: number, y: number, w: number, h: number
-): HTMLCanvasElement {
+function cropCanvas(src: HTMLCanvasElement, x: number, y: number, w: number, h: number): HTMLCanvasElement {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   c.getContext('2d')!.drawImage(src, x, y, w, h, 0, 0, w, h);
   return c;
 }
 
-/** Масштабировать canvas */
 function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
   const w = Math.round(src.width * scale), h = Math.round(src.height * scale);
   const c = document.createElement('canvas');
@@ -88,7 +77,7 @@ function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
   return c;
 }
 
-// ── Тип результата декодирования ──────────────────────────────────────────────
+// ── Результат декодирования ───────────────────────────────────────────────────
 interface DecodeHit {
   text:    string;
   pts:     readonly ResultPoint[] | null;
@@ -96,74 +85,81 @@ interface DecodeHit {
   offsetY: number;
 }
 
-/** Попытка декодировать один canvas ZXing-ом */
 async function tryDecodeCanvas(
   reader: BrowserDatamatrixCodeReader,
   canvas: HTMLCanvasElement,
   offsetX = 0,
-  offsetY = 0
+  offsetY = 0,
 ): Promise<DecodeHit | null> {
   try {
-    const r: Result = await (reader as any).decodeFromCanvas(canvas);
-    if (r) return { text: r.getText(), pts: r.getResultPoints(), offsetX, offsetY };
+    const r = await (reader as any).decodeFromCanvas(canvas);
+    if (r) return { text: r.getText() as string, pts: r.getResultPoints() as readonly ResultPoint[], offsetX, offsetY };
   } catch {}
   return null;
 }
 
+// ── Компонент ─────────────────────────────────────────────────────────────────
 export default function Scanner() {
-  const videoRef   = useRef<HTMLVideoElement>(null);
-  const canvasRef  = useRef<HTMLCanvasElement>(null);
-  const readerRef  = useRef<BrowserDatamatrixCodeReader | null>(null);
-  const streamRef  = useRef<MediaStream | null>(null);
+  const videoRef  = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const readerRef = useRef<BrowserDatamatrixCodeReader | null>(null);
 
-  // Флаги и дескрипторы циклов
-  const runningRef      = useRef(false);
-  const decodingRef     = useRef(false);
-  const rafRef          = useRef<number | null>(null);
-  const decodeTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Циклы (как потоки Python)
+  const runningRef     = useRef(false);
+  const decodingRef    = useRef(false);
+  const rafRef         = useRef<number | null>(null);
+  const decodeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Scan-lock (аналог Python _last_decoded / _last_decoded_t)
-  const lastDecoded     = useRef<string>('');
-  const lastDecodedTime = useRef<number>(0);
+  // Scan-lock (_last_decoded / _last_decoded_t)
+  const lastDecoded     = useRef('');
+  const lastDecodedTime = useRef(0);
+
+  // Ref для soundEnabled — чтобы изменение не пересоздавало замыкания
+  const soundEnabledRef = useRef(true);
 
   const [cameras, setCameras]             = useState<MediaDeviceInfo[]>([]);
-  const [selectedCamera, setSelectedCamera] = useState<string>('');
+  const [selectedCamera, setSelectedCamera] = useState('');
+  const [cameraLabels, setCameraLabels]   = useState<Record<string, string>>({});
   const [scanning, setScanning]           = useState(false);
   const [currentResult, setCurrentResult] = useState<QualityResult | null>(null);
   const [history, setHistory]             = useState<ScanRecord[]>([]);
-  const [cameraError, setCameraError]     = useState<string>('');
+  const [cameraError, setCameraError]     = useState('');
   const [soundEnabled, setSoundEnabled]   = useState(true);
   const [activeTab, setActiveTab]         = useState<'scan' | 'history'>('scan');
   const [fps, setFps]                     = useState(0);
-  const [brightness, setBrightness]       = useState(100);
-  const [contrast, setContrast]           = useState(100);
+  const [goProActive, setGoProActive]     = useState(false);
 
   const fpsCounter = useRef({ frames: 0, last: Date.now() });
 
+  // Синхронизируем ref с состоянием
+  useEffect(() => { soundEnabledRef.current = soundEnabled; }, [soundEnabled]);
+
+  // ── Перечисление камер ─────────────────────────────────────────────────────
   useEffect(() => {
     BrowserDatamatrixCodeReader.listVideoInputDevices().then((devices) => {
       setCameras(devices);
-      if (devices.length > 0) {
-        const back = devices.find(d =>
-          d.label.toLowerCase().includes('back') ||
-          d.label.toLowerCase().includes('rear') ||
-          d.label.toLowerCase().includes('environment')
-        );
-        // Последняя камера — обычно наилучшего качества
-        setSelectedCamera(back?.deviceId ?? devices[devices.length - 1].deviceId);
-      }
+      const labels: Record<string, string> = {};
+      devices.forEach(d => { labels[d.deviceId] = d.label || `Камера ${d.deviceId.slice(0, 8)}`; });
+      setCameraLabels(labels);
+
+      if (devices.length === 0) return;
+
+      // Приоритет: GoPro → задняя камера → последняя в списке
+      const gopro = devices.find(d => isGoPro(d.label));
+      const back  = devices.find(d => /back|rear|environment/i.test(d.label));
+      setSelectedCamera((gopro ?? back ?? devices[devices.length - 1]).deviceId);
     }).catch(() => {
       setCameraError('Не удалось получить список камер. Разрешите доступ к камере в браузере.');
     });
   }, []);
 
-  // ── ROI из result points (с учётом смещения кропа) ───────────────────────
+  // ── ROI из result points с учётом смещения кропа ──────────────────────────
   const computeRoi = useCallback((
     frame: HTMLCanvasElement,
     pts:   readonly ResultPoint[] | null,
-    ox:    number,
-    oy:    number
-  ): { x: number; y: number; w: number; h: number } => {
+    ox: number, oy: number,
+  ) => {
     const fw = frame.width, fh = frame.height;
     if (pts && pts.length >= 2) {
       const xs = Array.from(pts).map(p => p.getX() + ox);
@@ -180,38 +176,30 @@ export default function Scanner() {
         if (rw > 10 && rh > 10) return { x: rx, y: ry, w: rw, h: rh };
       }
     }
-    // Fallback: центральные 50% кадра
     const mx = Math.floor(fw * 0.25), my = Math.floor(fh * 0.25);
     return { x: mx, y: my, w: fw - 2 * mx, h: fh - 2 * my };
   }, []);
 
-  // ── Обработка успешного декодирования ────────────────────────────────────
+  // ── Обработка декодирования ────────────────────────────────────────────────
   const handleDecoded = useCallback((hit: DecodeHit, frame: HTMLCanvasElement) => {
     const now = Date.now();
-    // Scan-lock: тот же код в течение SCAN_LOCK_MS — пропускаем
     if (hit.text === lastDecoded.current && now - lastDecodedTime.current < SCAN_LOCK_MS) return;
 
     lastDecoded.current     = hit.text;
     lastDecodedTime.current = now;
-
-    // Авто-сброс scan-lock через SCAN_LOCK_MS — сразу ищем следующий код
-    setTimeout(() => {
-      lastDecoded.current     = '';
-      lastDecodedTime.current = 0;
-    }, SCAN_LOCK_MS);
+    setTimeout(() => { lastDecoded.current = ''; lastDecodedTime.current = 0; }, SCAN_LOCK_MS);
 
     const roi    = computeRoi(frame, hit.pts, hit.offsetX, hit.offsetY);
     const result = analyzeQuality(frame, hit.text, roi);
-    if (soundEnabled) playGradeSound(result.overallGrade);
+    if (soundEnabledRef.current) playGradeSound(result.overallGrade);
     setCurrentResult(result);
     setHistory(prev => [
       { id: `${now}-${Math.random().toString(36).slice(2)}`, result },
       ...prev.slice(0, 49),
     ]);
-  }, [soundEnabled, computeRoi]);
+  }, [computeRoi]);
 
-  // ── Поток 1: захват кадров (requestAnimationFrame) ────────────────────────
-  // Аналог Python _capture_loop
+  // ── Поток 1: захват кадров (requestAnimationFrame = _capture_loop) ─────────
   const startCaptureLoop = useCallback(() => {
     const loop = () => {
       if (!runningRef.current) return;
@@ -220,30 +208,21 @@ export default function Scanner() {
       if (video && canvas && video.readyState >= 2) {
         canvas.width  = video.videoWidth  || 640;
         canvas.height = video.videoHeight || 480;
-        const ctx = canvas.getContext('2d')!;
-        
-        // Применяем яркость и контраст
-        ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`;
-        ctx.drawImage(video, 0, 0);
-        ctx.filter = 'none';
-
-        const f = fpsCounter.current;
-        f.frames++;
+        canvas.getContext('2d')!.drawImage(video, 0, 0);
+        fpsCounter.current.frames++;
         const now = Date.now();
-        if (now - f.last >= 1000) {
-          setFps(f.frames);
-          f.frames = 0;
-          f.last   = now;
+        if (now - fpsCounter.current.last >= 1000) {
+          setFps(fpsCounter.current.frames);
+          fpsCounter.current = { frames: 0, last: now };
         }
       }
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-  }, [brightness, contrast]);
+  }, []);
 
-  // ── Поток 2: декодирование (setInterval 150ms) ────────────────────────────
-  // Аналог Python _decode_loop с _decode_interval = 0.15
-  // 3 шага: полный кадр → центральная зона → препроцессинг
+  // ── Поток 2: декодирование каждые 150ms (_decode_loop) ────────────────────
+  // 3 шага: полный кадр → центр 70% → препроцессинг-варианты
   const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
     if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
 
@@ -257,10 +236,10 @@ export default function Scanner() {
         const fw = canvas.width, fh = canvas.height;
         let hit: DecodeHit | null = null;
 
-        // ── Шаг 1: полный кадр (аналог Python step 1) ──────────────────
+        // Шаг 1: полный кадр
         hit = await tryDecodeCanvas(reader, canvas);
 
-        // ── Шаг 2: центральная зона 70% (аналог Python step 2, m=0.15) ─
+        // Шаг 2: центральная зона 70% (margin 15%, как в Python m=0.15)
         if (!hit) {
           const m  = 0.15;
           const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
@@ -270,8 +249,7 @@ export default function Scanner() {
           }
         }
 
-        // ── Шаг 3: препроцессинг (аналог Python try_decode_dmtx variants) ─
-        // CLAHE-аппроксимация, резкость, инверсия, масштаб 1.5×
+        // Шаг 3: препроцессинг-варианты (ранний выход при успехе)
         if (!hit) {
           const ctx  = canvas.getContext('2d')!;
           const img  = ctx.getImageData(0, 0, fw, fh);
@@ -282,7 +260,7 @@ export default function Scanner() {
           stretchContrast(d1, gray);
           hit = await tryDecodeCanvas(reader, makeCanvas(d1, fw, fh));
 
-          // 3b: контраст + инверсия (тёмный фон)
+          // 3b: инверсия (тёмный фон — светлые модули)
           if (!hit) {
             const d2 = new Uint8ClampedArray(d1);
             for (let i = 0; i < d2.length; i += 4) {
@@ -293,22 +271,19 @@ export default function Scanner() {
 
           // 3c: резкость
           if (!hit) {
-            const sg = sharpen(gray, fw, fh);
             const d3 = new Uint8ClampedArray(img.data);
-            applyGray(d3, sg);
+            sharpenGray(gray, fw, fh, d3);
             hit = await tryDecodeCanvas(reader, makeCanvas(d3, fw, fh));
           }
 
-          // 3d: масштаб 1.5× центрального кропа (маленький символ)
+          // 3d: масштаб 1.5× центрального кропа (мелкий символ)
           if (!hit) {
             const m  = 0.20;
             const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
             const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
             if (cw > 20 && ch > 20) {
               hit = await tryDecodeCanvas(
-                reader,
-                scaleCanvas(cropCanvas(canvas, cx, cy, cw, ch), 1.5),
-                cx, cy
+                reader, scaleCanvas(cropCanvas(canvas, cx, cy, cw, ch), 1.5), cx, cy,
               );
             }
           }
@@ -316,52 +291,56 @@ export default function Scanner() {
 
         if (hit) handleDecoded(hit, canvas);
       } finally {
+        // Декодер всегда готов к следующему кадру
         decodingRef.current = false;
       }
     }, DECODE_INTERVAL_MS);
   }, [handleDecoded]);
 
-  // ── Запуск/остановка сканирования ─────────────────────────────────────────
+  // ── Остановка всех циклов ──────────────────────────────────────────────────
   const stopAllLoops = useCallback(() => {
     runningRef.current = false;
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-    if (decodeTimerRef.current !== null) {
-      clearInterval(decodeTimerRef.current);
-      decodeTimerRef.current = null;
-    }
+    if (rafRef.current !== null)         { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (decodeTimerRef.current !== null) { clearInterval(decodeTimerRef.current); decodeTimerRef.current = null; }
   }, []);
 
   const stopScanning = useCallback(() => {
     stopAllLoops();
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
     setScanning(false);
     setFps(0);
+    setGoProActive(false);
   }, [stopAllLoops]);
 
+  // ── Запуск сканирования ────────────────────────────────────────────────────
   const startScanning = useCallback(async () => {
     if (!selectedCamera) return;
     setCameraError('');
     stopAllLoops();
 
     try {
-      // Получаем камеру (3 попытки с деградацией ограничений)
+      const label     = cameraLabels[selectedCamera] ?? '';
+      const goPro     = isGoPro(label);
       let stream: MediaStream | null = null;
+
+      // Ограничения под камеру:
+      // GoPro11 поддерживает до 4K/60fps; обычная вебкамера — 1080p/60fps
+      const highResConstraints: MediaTrackConstraints = goPro ? {
+        deviceId: { exact: selectedCamera },
+        width:     { ideal: 3840, min: 1280 },
+        height:    { ideal: 2160, min: 720  },
+        frameRate: { ideal: 60,   min: 30   },
+      } : {
+        deviceId: { exact: selectedCamera },
+        width:     { ideal: 1920, min: 1280 },
+        height:    { ideal: 1080, min: 720  },
+        frameRate: { ideal: 60,   min: 30   },
+      };
+
       try {
-        const constraints: any = {
-          deviceId: { exact: selectedCamera },
-          width:     { ideal: 1920, min: 1280 },
-          height:    { ideal: 1080, min: 720 },
-          frameRate: { ideal: 60,   min: 30  },
-          focusMode: 'continuous',
-        };
-        stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
+        stream = await navigator.mediaDevices.getUserMedia({ video: highResConstraints, audio: false });
       } catch {
         try {
           stream = await navigator.mediaDevices.getUserMedia({
@@ -369,10 +348,7 @@ export default function Scanner() {
             audio: false,
           });
         } catch {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { deviceId: selectedCamera },
-            audio: false,
-          });
+          stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: selectedCamera }, audio: false });
         }
       }
 
@@ -382,22 +358,25 @@ export default function Scanner() {
         await videoRef.current.play();
       }
 
-      // Создаём ZXing reader с TRY_HARDER
-      const hints = new Map<DecodeHintType, any>();
-      hints.set(DecodeHintType.TRY_HARDER, true);
-      const reader = new BrowserDatamatrixCodeReader(hints);
-      readerRef.current = reader;
+      // ZXing reader с TRY_HARDER — создаём один раз, держим всё время
+      if (!readerRef.current) {
+        const hints = new Map<DecodeHintType, any>();
+        hints.set(DecodeHintType.TRY_HARDER, true);
+        readerRef.current = new BrowserDatamatrixCodeReader(hints);
+      }
 
       runningRef.current = true;
-      startCaptureLoop();        // Поток 1: захват кадров
-      startDecodeLoop(reader);   // Поток 2: декодирование
+      fpsCounter.current = { frames: 0, last: Date.now() };
+      startCaptureLoop();
+      startDecodeLoop(readerRef.current);
 
       setScanning(true);
+      setGoProActive(goPro);
     } catch (e: any) {
       setCameraError(`Ошибка запуска камеры: ${e?.message || e}`);
       setScanning(false);
     }
-  }, [selectedCamera, stopAllLoops, startCaptureLoop, startDecodeLoop]);
+  }, [selectedCamera, cameraLabels, stopAllLoops, startCaptureLoop, startDecodeLoop]);
 
   useEffect(() => () => { stopScanning(); }, []);
 
@@ -422,6 +401,9 @@ export default function Scanner() {
         </div>
         <div className="flex items-center gap-3">
           <span className="text-xs text-muted-foreground hidden sm:block">Свидович А. · Петляков А.</span>
+          {goProActive && (
+            <span className="text-xs font-semibold bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded">GoPro</span>
+          )}
           {scanning && (
             <span className="text-xs text-primary font-mono bg-primary/10 px-2 py-0.5 rounded">{fps} fps</span>
           )}
@@ -466,10 +448,10 @@ export default function Scanner() {
                 onChange={e => setSelectedCamera(e.target.value)}
                 disabled={scanning}
               >
-                {cameras.length === 0 && <option value="">Нет доступных камер</option>}
+                {cameras.length === 0 && <option key="none" value="">Нет доступных камер</option>}
                 {cameras.map(c => (
                   <option key={c.deviceId} value={c.deviceId}>
-                    {c.label || `Камера ${c.deviceId.slice(0, 8)}`}
+                    {isGoPro(c.label) ? `📷 ${c.label}` : (c.label || `Камера ${c.deviceId.slice(0, 8)}`)}
                   </option>
                 ))}
               </select>
@@ -485,34 +467,6 @@ export default function Scanner() {
             >
               {scanning ? 'Стоп' : 'Старт'}
             </button>
-          </div>
-
-          {/* Управление яркостью и контрастом */}
-          <div className="p-4 bg-card border-t border-border/50 space-y-3">
-            <div className="flex items-center gap-3">
-              <label className="text-xs text-muted-foreground w-20">Яркость</label>
-              <input
-                type="range"
-                min="50"
-                max="150"
-                value={brightness}
-                onChange={(e) => setBrightness(Number(e.target.value))}
-                className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
-              />
-              <span className="text-xs font-mono w-12 text-right">{brightness}%</span>
-            </div>
-            <div className="flex items-center gap-3">
-              <label className="text-xs text-muted-foreground w-20">Контраст</label>
-              <input
-                type="range"
-                min="50"
-                max="150"
-                value={contrast}
-                onChange={(e) => setContrast(Number(e.target.value))}
-                className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
-              />
-              <span className="text-xs font-mono w-12 text-right">{contrast}%</span>
-            </div>
           </div>
 
           {cameraError && (

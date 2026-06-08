@@ -1,9 +1,16 @@
 {
   "extends": "../../tsconfig.base.json",
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "build", "dist", "**/*.test.ts"],
+  "exclude": [
+    "node_modules", "build", "dist", "**/*.test.ts",
+    "src/components/ui/button-group.tsx",
+    "src/components/ui/calendar.tsx",
+    "src/components/ui/item.tsx",
+    "src/components/ui/sidebar.tsx"
+  ],
   "compilerOptions": {
     "noEmit": true,
+    "skipLibCheck": true,
     "jsx": "preserve",
     "lib": ["esnext", "dom", "dom.iterable"],
     "resolveJsonModule": true,

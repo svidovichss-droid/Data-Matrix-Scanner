@@ -12,49 +12,71 @@ function getAudioCtx(): AudioContext {
   return audioCtx;
 }
 
-function playBeep(ctx: AudioContext, freq: number, duration: number, startTime: number, type: OscillatorType = 'sine', gain = 0.4): void {
+function beep(
+  ctx: AudioContext,
+  freq: number,
+  t: number,
+  dur: number,
+  gain = 0.38,
+  type: OscillatorType = 'sine',
+  freqEnd?: number,
+): void {
   const osc = ctx.createOscillator();
-  const gainNode = ctx.createGain();
-  osc.connect(gainNode);
-  gainNode.connect(ctx.destination);
+  const g   = ctx.createGain();
+  osc.connect(g);
+  g.connect(ctx.destination);
+
   osc.type = type;
-  osc.frequency.setValueAtTime(freq, startTime);
-  gainNode.gain.setValueAtTime(0, startTime);
-  gainNode.gain.linearRampToValueAtTime(gain, startTime + 0.01);
-  gainNode.gain.setValueAtTime(gain, startTime + duration - 0.02);
-  gainNode.gain.linearRampToValueAtTime(0, startTime + duration);
-  osc.start(startTime);
-  osc.stop(startTime + duration);
+  osc.frequency.setValueAtTime(freq, t);
+  if (freqEnd !== undefined) {
+    osc.frequency.linearRampToValueAtTime(freqEnd, t + dur);
+  }
+
+  // Быстрая атака, чёткое затухание
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(gain, t + 0.008);
+  g.gain.setValueAtTime(gain, t + dur - 0.015);
+  g.gain.linearRampToValueAtTime(0, t + dur);
+
+  osc.start(t);
+  osc.stop(t + dur + 0.002);
 }
 
 export function playGradeSound(grade: Grade): void {
   try {
     const ctx = getAudioCtx();
-    const now = ctx.currentTime;
+    const t   = ctx.currentTime;
 
     if (grade === 'A') {
-      playBeep(ctx, 880, 0.12, now, 'sine', 0.35);
-      playBeep(ctx, 1100, 0.15, now + 0.14, 'sine', 0.35);
+      // Чистый двойной восходящий сигнал — «отлично»
+      beep(ctx, 900,  t,        0.09, 0.38, 'sine');
+      beep(ctx, 1320, t + 0.11, 0.13, 0.38, 'sine');
+
     } else if (grade === 'B') {
-      playBeep(ctx, 780, 0.12, now, 'sine', 0.3);
-      playBeep(ctx, 980, 0.15, now + 0.14, 'sine', 0.3);
+      // Хорошо — чуть ниже
+      beep(ctx, 780,  t,        0.09, 0.35, 'sine');
+      beep(ctx, 1050, t + 0.11, 0.12, 0.35, 'sine');
+
     } else if (grade === 'C') {
-      playBeep(ctx, 660, 0.1, now, 'triangle', 0.3);
-      playBeep(ctx, 660, 0.1, now + 0.18, 'triangle', 0.3);
+      // Нейтральный двойной — «удовлетворительно»
+      beep(ctx, 660, t,        0.10, 0.32, 'triangle');
+      beep(ctx, 660, t + 0.17, 0.10, 0.28, 'triangle');
+
     } else if (grade === 'D') {
-      for (let i = 0; i < 4; i++) {
-        const t = now + i * 0.25;
-        const freq = i % 2 === 0 ? 440 : 380;
-        playBeep(ctx, freq, 0.15, t, 'sawtooth', 0.25);
-      }
+      // Нисходящее предупреждение — три тона
+      beep(ctx, 680, t,        0.13, 0.30, 'sawtooth');
+      beep(ctx, 520, t + 0.17, 0.13, 0.28, 'sawtooth');
+      beep(ctx, 380, t + 0.34, 0.16, 0.26, 'sawtooth');
+
     } else if (grade === 'F') {
-      for (let i = 0; i < 8; i++) {
-        const t = now + i * 0.18;
-        const freq = i % 2 === 0 ? 320 : 200;
-        playBeep(ctx, freq, 0.12, t, 'sawtooth', 0.3);
+      // Аварийная сирена — 4 импульса, по два тона каждый
+      for (let i = 0; i < 4; i++) {
+        const base = t + i * 0.22;
+        beep(ctx, 440, base,        0.09, 0.30, 'sawtooth');
+        beep(ctx, 280, base + 0.10, 0.09, 0.28, 'sawtooth');
       }
     }
-  } catch (e) {
-    console.warn('Audio feedback error:', e);
+  } catch {
+    // AudioContext недоступен — игнорируем
   }
 }
