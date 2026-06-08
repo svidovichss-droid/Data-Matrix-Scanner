@@ -13,9 +13,12 @@ export interface ScanRecord {
   result: QualityResult;
 }
 
-// ── Константы — соответствуют Python-проекту ──────────────────────────────────
-const DECODE_INTERVAL_MS = 150;   // _decode_interval = 0.15 сек
-const SCAN_LOCK_MS       = 1500;  // _scan_lock_ms
+// ── Константы ─────────────────────────────────────────────────────────────────
+const DECODE_INTERVAL_MS  = 50;    // Интервал опроса (мс) — чаще = быстрее реакция
+const SCAN_LOCK_MS         = 1500; // Блокировка повтора одного кода
+const STEP1_TIMEOUT_MS     = 100;  // Бюджет времени на шаг 1 (полный кадр)
+const STEP_EXTRA_TIMEOUT_MS = 80;  // Бюджет на шаги 2-4 (препроцессинг)
+const HARD_SEARCH_AFTER_MS  = 400; // Делать тяжёлый поиск только если код был &lt;400мс назад
 
 // ── Определение GoPro ─────────────────────────────────────────────────────────
 function isGoPro(label: string): boolean {
@@ -85,15 +88,29 @@ interface DecodeHit {
   offsetY: number;
 }
 
+/**
+ * Декодирование canvas с жёстким таймаутом.
+ * Promise.race гарантирует, что мы не ждём ZXing дольше `ms` мс,
+ * даже если он ещё работает в фоне — интервал может стартовать следующую попытку.
+ */
 async function tryDecodeCanvas(
   reader: BrowserDatamatrixCodeReader,
   canvas: HTMLCanvasElement,
   offsetX = 0,
   offsetY = 0,
+  ms = STEP1_TIMEOUT_MS,
 ): Promise<DecodeHit | null> {
   try {
-    const r = await (reader as any).decodeFromCanvas(canvas);
-    if (r) return { text: r.getText() as string, pts: r.getResultPoints() as readonly ResultPoint[], offsetX, offsetY };
+    const result = await Promise.race<any>([
+      (reader as any).decodeFromCanvas(canvas),
+      new Promise<null>(res => setTimeout(() => res(null), ms)),
+    ]);
+    if (result) return {
+      text:    result.getText() as string,
+      pts:     result.getResultPoints() as readonly ResultPoint[],
+      offsetX,
+      offsetY,
+    };
   } catch {}
   return null;
 }
@@ -221,10 +238,30 @@ export default function Scanner() {
     rafRef.current = requestAnimationFrame(loop);
   }, []);
 
-  // ── Поток 2: декодирование каждые 150ms (_decode_loop) ────────────────────
-  // 3 шага: полный кадр → центр 70% → препроцессинг-варианты
+  // ── Поток 2: декодирование (setInterval = _decode_loop) ──────────────────
+  //
+  // Стратегия «мгновенного» обнаружения:
+  //
+  //  • Интервал 50ms — частый опрос
+  //  • Каждый вызов ZXing ограничен таймаутом через Promise.race:
+  //      Шаг 1 (полный кадр) — до STEP1_TIMEOUT_MS (100ms)
+  //      Шаги 2-4            — до STEP_EXTRA_TIMEOUT_MS (80ms) каждый
+  //  • Адаптивный поиск:
+  //      – Если код виден или был виден < HARD_SEARCH_AFTER_MS назад →
+  //        полный pipeline (1→2→3→4), ZXing ищет изо всех сил
+  //      – Иначе → только шаг 1; если пусто — сразу следующий интервал
+  //        (экономим CPU, не делаем лишний препроцессинг)
+  //  • Мгновенный сброс scan-lock:
+  //      Если декодер вернул null И scan-lock активен — код ушёл из кадра.
+  //      Сбрасываем lock немедленно, чтобы следующий код принялся с первой
+  //      же попытки, не ожидая 1500ms таймера.
+  //
   const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
     if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
+
+    // Счётчик последовательных null-ов для защиты от случайных пропусков
+    let nullStreak = 0;
+    const NULL_STREAK_RESET = 2; // сколько null подряд = «код ушёл»
 
     decodeTimerRef.current = setInterval(async () => {
       if (decodingRef.current || !runningRef.current) return;
@@ -234,64 +271,84 @@ export default function Scanner() {
       decodingRef.current = true;
       try {
         const fw = canvas.width, fh = canvas.height;
+        const codeWasRecent = Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS;
         let hit: DecodeHit | null = null;
 
-        // Шаг 1: полный кадр
-        hit = await tryDecodeCanvas(reader, canvas);
+        // ── Шаг 1: полный кадр, лимит STEP1_TIMEOUT_MS ──────────────────────
+        hit = await tryDecodeCanvas(reader, canvas, 0, 0, STEP1_TIMEOUT_MS);
 
-        // Шаг 2: центральная зона 70% (margin 15%, как в Python m=0.15)
-        if (!hit) {
+        // ── Шаги 2-4: только если код был недавно или lock активен ──────────
+        if (!hit && codeWasRecent) {
+
+          // Шаг 2: центральная зона 70% (margin 15%)
           const m  = 0.15;
           const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
           const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
           if (cw > 20 && ch > 20) {
-            hit = await tryDecodeCanvas(reader, cropCanvas(canvas, cx, cy, cw, ch), cx, cy);
+            hit = await tryDecodeCanvas(
+              reader, cropCanvas(canvas, cx, cy, cw, ch), cx, cy, STEP_EXTRA_TIMEOUT_MS,
+            );
+          }
+
+          // Шаг 3: контраст-стретч
+          if (!hit) {
+            const ctx  = canvas.getContext('2d')!;
+            const img  = ctx.getImageData(0, 0, fw, fh);
+            const gray = makeGray(img.data);
+            const d1   = new Uint8ClampedArray(img.data);
+            stretchContrast(d1, gray);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d1, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
+
+            // Шаг 4a: инверсия (тёмный фон)
+            if (!hit) {
+              const d2 = new Uint8ClampedArray(d1);
+              for (let i = 0; i < d2.length; i += 4) {
+                d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
+              }
+              hit = await tryDecodeCanvas(reader, makeCanvas(d2, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
+            }
+
+            // Шаг 4b: резкость
+            if (!hit) {
+              const d3 = new Uint8ClampedArray(img.data);
+              sharpenGray(gray, fw, fh, d3);
+              hit = await tryDecodeCanvas(reader, makeCanvas(d3, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
+            }
+
+            // Шаг 4c: масштаб 1.5× центра (мелкий символ)
+            if (!hit) {
+              const sm  = 0.20;
+              const scx = Math.floor(fw * sm),        scy = Math.floor(fh * sm);
+              const scw = Math.floor(fw * (1-2*sm)),  sch = Math.floor(fh * (1-2*sm));
+              if (scw > 20 && sch > 20) {
+                hit = await tryDecodeCanvas(
+                  reader,
+                  scaleCanvas(cropCanvas(canvas, scx, scy, scw, sch), 1.5),
+                  scx, scy,
+                  STEP_EXTRA_TIMEOUT_MS,
+                );
+              }
+            }
           }
         }
 
-        // Шаг 3: препроцессинг-варианты (ранний выход при успехе)
+        // ── Мгновенный сброс scan-lock ────────────────────────────────────────
+        // Если ничего не нашли — считаем null подряд.
+        // После NULL_STREAK_RESET пропусков считаем, что код ушёл из кадра,
+        // и снимаем lock немедленно. Это позволяет тому же коду (или другому)
+        // сканироваться без ожидания 1500ms.
         if (!hit) {
-          const ctx  = canvas.getContext('2d')!;
-          const img  = ctx.getImageData(0, 0, fw, fh);
-          const gray = makeGray(img.data);
-
-          // 3a: контраст-стретч
-          const d1 = new Uint8ClampedArray(img.data);
-          stretchContrast(d1, gray);
-          hit = await tryDecodeCanvas(reader, makeCanvas(d1, fw, fh));
-
-          // 3b: инверсия (тёмный фон — светлые модули)
-          if (!hit) {
-            const d2 = new Uint8ClampedArray(d1);
-            for (let i = 0; i < d2.length; i += 4) {
-              d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
-            }
-            hit = await tryDecodeCanvas(reader, makeCanvas(d2, fw, fh));
+          nullStreak++;
+          if (nullStreak >= NULL_STREAK_RESET && lastDecoded.current !== '') {
+            lastDecoded.current     = '';
+            lastDecodedTime.current = 0;
+            nullStreak = 0;
           }
-
-          // 3c: резкость
-          if (!hit) {
-            const d3 = new Uint8ClampedArray(img.data);
-            sharpenGray(gray, fw, fh, d3);
-            hit = await tryDecodeCanvas(reader, makeCanvas(d3, fw, fh));
-          }
-
-          // 3d: масштаб 1.5× центрального кропа (мелкий символ)
-          if (!hit) {
-            const m  = 0.20;
-            const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
-            const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
-            if (cw > 20 && ch > 20) {
-              hit = await tryDecodeCanvas(
-                reader, scaleCanvas(cropCanvas(canvas, cx, cy, cw, ch), 1.5), cx, cy,
-              );
-            }
-          }
+        } else {
+          nullStreak = 0;
+          handleDecoded(hit, canvas);
         }
-
-        if (hit) handleDecoded(hit, canvas);
       } finally {
-        // Декодер всегда готов к следующему кадру
         decodingRef.current = false;
       }
     }, DECODE_INTERVAL_MS);
