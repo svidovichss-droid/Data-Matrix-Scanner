@@ -15,11 +15,12 @@ export interface ScanRecord {
 }
 
 // ── Константы ─────────────────────────────────────────────────────────────────
-const DECODE_INTERVAL_MS  = 30;    // мс между попытками декодирования
-const SCAN_LOCK_MS        = 1500;  // блокировка повтора одного и того же кода
-const HARD_SEARCH_AFTER_MS = 800;  // делать шаги 2-4 если код был виден < 800мс назад
-const NULL_STREAK_RESET   = 1;     // 1 null подряд = «код ушёл из кадра» → lock снят
-const PHOTO_TTL_MS        = 8000;  // фото авто-удаляется через 8 сек
+const DECODE_INTERVAL_MS    = 30;   // мс между попытками декодирования
+const SCAN_LOCK_MS          = 1500; // блокировка повтора одного и того же кода
+const HARD_SEARCH_AFTER_MS  = 800;  // полный ZXing+препроц если код был <800мс назад
+const NULL_STREAK_RESET     = 1;    // 1 null = «код ушёл из кадра» → lock снят
+const COLD_FALLBACK_TICKS   = 7;    // страховочный ZXing раз в N «холодных» тиков
+const PHOTO_TTL_MS          = 8000; // фото авто-удаляется через 8 сек
 
 // Размер canvas для ZXing-детекции.
 // В 9 раз меньше пикселей (vs 1080p) → ZXing в 9 раз быстрее.
@@ -78,12 +79,89 @@ function cropCanvas(src: HTMLCanvasElement, x: number, y: number, w: number, h: 
   return c;
 }
 
-function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
-  const w = Math.round(src.width * scale), h = Math.round(src.height * scale);
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  c.getContext('2d')!.drawImage(src, 0, 0, w, h);
-  return c;
+// ── Порог Отсу ────────────────────────────────────────────────────────────────
+// Автоматически выбирает порог бинаризации. Работает за O(256 + N) ≈ ~1ms.
+function otsuThreshold(gray: Float32Array): number {
+  const hist = new Int32Array(256);
+  for (const v of gray) hist[v | 0]++;
+  const total = gray.length;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let w0 = 0, sumB = 0, maxVar = 0, threshold = 128;
+  for (let t = 0; t < 255; t++) {
+    w0 += hist[t]; if (!w0) continue;
+    const w1 = total - w0; if (!w1) break;
+    sumB += t * hist[t];
+    const mu0 = sumB / w0;
+    const mu1 = (sum - sumB) / w1;
+    const variance = w0 * w1 * (mu0 - mu1) ** 2;
+    if (variance > maxVar) { maxVar = variance; threshold = t; }
+  }
+  return threshold;
+}
+
+// ── L-паттерн DataMatrix ──────────────────────────────────────────────────────
+// DataMatrix всегда содержит две сплошные границы:
+//   • левая вертикальная  — от верха к низу
+//   • нижняя горизонтальная — от левого края к правому
+// Вместе они образуют «L» с углом в нижнем-левом углу символа.
+//
+// Алгоритм (~1-2ms без ZXing):
+//   Сканируем изображение с шагом STRIDE.
+//   Для каждого тёмного пикселя измеряем:
+//     hLen = длина непрерывного тёмного пробега ВПРАВО  (нижняя граница)
+//     vLen = длина непрерывного тёмного пробега ВВЕРХ   (левая граница)
+//   Если оба пробега достаточно длинны и примерно равны → это угол L.
+//   Возвращаем до 5 кандидатов.
+interface LCandidate {
+  x:    number; // x угла в координатах decode-canvas
+  y:    number; // y угла
+  size: number; // оценочный размер символа в пикселях
+}
+
+function findLCandidates(
+  gray:      Float32Array,
+  w:         number,
+  h:         number,
+  threshold: number,
+): LCandidate[] {
+  const candidates: LCandidate[] = [];
+  const minArm    = Math.max(5, Math.floor(Math.min(w, h) * 0.025));
+  const maxArm    = Math.floor(Math.min(w, h) * 0.72);
+  const STRIDE    = 2;
+
+  for (let y = minArm; y < h - 1; y += STRIDE) {
+    for (let x = 0; x < w - minArm; x += STRIDE) {
+      if (gray[y * w + x] > threshold) continue;
+
+      // Горизонтальный пробег вправо (нижняя граница L)
+      let hLen = 1;
+      while (x + hLen < w && gray[y * w + x + hLen] <= threshold) hLen++;
+      if (hLen < minArm || hLen > maxArm) { x += hLen - 1; continue; }
+
+      // Вертикальный пробег вверх (левая граница L)
+      let vLen = 1;
+      while (y - vLen >= 0 && gray[(y - vLen) * w + x] <= threshold) vLen++;
+      if (vLen < minArm || vLen > maxArm) continue;
+
+      // Руки должны быть близки по длине (±40%)
+      if (Math.min(hLen, vLen) < Math.max(hLen, vLen) * 0.60) continue;
+
+      const size = Math.round((hLen + vLen) / 2 * 1.1);
+
+      // Дедупликация: убираем кандидатов в радиусе 40% от уже найденных
+      const clusterR = Math.max(10, size * 0.4);
+      let dup = false;
+      for (const c of candidates) {
+        if (Math.abs(c.x - x) < clusterR && Math.abs(c.y - y) < clusterR) { dup = true; break; }
+      }
+      if (dup) continue;
+
+      candidates.push({ x, y, size });
+      if (candidates.length >= 5) return candidates;
+    }
+  }
+  return candidates;
 }
 
 // ── Результат декодирования ───────────────────────────────────────────────────
@@ -290,24 +368,29 @@ export default function Scanner() {
 
   // ── Поток 2: декодирование ────────────────────────────────────────────────
   //
-  // Ключевая идея — ZXing работает на маленьком canvas (640×360):
-  //   • 640×360 = 230k пикселей vs 2M у 1080p → ZXing в ~9 раз быстрее
-  //   • На маленьком canvas "fail fast" = 20-80ms (vs 200-500ms на полном)
-  //   • Нет нужды в искусственных таймаутах / Promise.race
+  // Архитектура:
   //
-  // Pipeline (все шаги — на decode canvas):
-  //   Шаг 1: полный decode canvas                             (всегда)
-  //   Шаг 2: центральная зона 70%                            (если код был недавно)
-  //   Шаг 3: контраст-стретч + инверсия + резкость           (если код был недавно)
-  //   Шаг 4: масштаб 1.5× центра (мелкий символ)             (если код был недавно)
+  //  Шаг 0 (~1-2ms): Otsu-бинаризация + findLCandidates
+  //    DataMatrix всегда имеет L-паттерн (левая+нижняя сплошные границы).
+  //    Ищем угол L без ZXing — чистый JavaScript по пикселям.
   //
-  // Мгновенный сброс scan-lock:
-  //   NULL_STREAK_RESET пропусков подряд → код ушёл → lock снимается немедленно.
+  //  Если L найден:
+  //    → ZXing на кропе вокруг кандидата (обычно ~50-150px кроп, ~5ms)
+  //    → Если не взял — ZXing на полном decode canvas
+  //
+  //  Если L не найден, но код был виден <HARD_SEARCH_AFTER_MS:
+  //    → Полный ZXing + препроцессинг (код уходит / поворачивается)
+  //
+  //  Если L не найден и код давно не виден:
+  //    → Пропускаем ZXing (~2ms тик — быстрый null streak)
+  //    → Каждые COLD_FALLBACK_TICKS тиков: страховочный полный ZXing
+  //      (для повёрнутых / нестандартных кодов при первом появлении)
   //
   const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
     if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
 
     let nullStreak = 0;
+    let coldTicks  = 0; // тики без L-паттерна и без recent-кода
 
     decodeTimerRef.current = setInterval(async () => {
       if (decodingRef.current || !runningRef.current) return;
@@ -319,67 +402,66 @@ export default function Scanner() {
         const { width: dw, height: dh } = dc;
         let hit: DecodeHit | null = null;
 
-        // Шаг 1: полный decode canvas — ВСЕГДА.
-        // ZXing "fail fast" на 640×360 ≈ 20-40ms → дёшево даже когда кода нет.
-        hit = await tryDecodeCanvas(reader, dc);
+        // ── Шаг 0: grayscale + Otsu + поиск L-паттерна (~1-2ms) ──────────
+        const ctx      = dc.getContext('2d')!;
+        const imgData  = ctx.getImageData(0, 0, dw, dh);
+        const gray     = makeGray(imgData.data);
+        const thr      = otsuThreshold(gray);
+        const lcands   = findLCandidates(gray, dw, dh, thr);
+        const codeWasRecent = Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS;
 
-        // Шаги 2-4: только если код был виден < HARD_SEARCH_AFTER_MS назад.
-        //
-        // Зачем ограничение? ZXing с TRY_HARDER на "пустом" кадре занимает
-        // 100-400ms. При 4 шагах это 400ms-1.6s за тик. Null-streak никогда
-        // не успевает накопиться → lock не снимается → следующий код не ловится.
-        //
-        // Когда ограничение безопасно? После первой детекции любого кода ZXing
-        // уже знает, что "что-то есть" в кадре, и шаги 2-4 помогают при
-        // плохом освещении/расфокусе. Для совсем нового кода Step 1 справляется
-        // сам — он находит любой читаемый код за 1 тик (≤ 40ms).
-        if (!hit && Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS) {
-
-          // Шаг 2: центр 70%
-          if (!hit) {
-            const m  = 0.15;
-            const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
-            const cw = Math.floor(dw * (1-2*m)), ch = Math.floor(dh * (1-2*m));
-            if (cw > 20 && ch > 20) {
-              hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
-            }
+        if (lcands.length > 0) {
+          // ── L-паттерн найден: ZXing только на кропах (~5-15ms) ──────────
+          for (const { x, y, size } of lcands) {
+            const pad   = Math.floor(size * 0.4);
+            const cropX = Math.max(0,       x - pad);
+            const cropY = Math.max(0,       y - size - pad);
+            const cropW = Math.min(dw - cropX, size + 2 * pad);
+            const cropH = Math.min(dh - cropY, size + 2 * pad);
+            if (cropW < 12 || cropH < 12) continue;
+            hit = await tryDecodeCanvas(
+              reader, cropCanvas(dc, cropX, cropY, cropW, cropH), cropX, cropY,
+            );
+            if (hit) break;
           }
+          // Кроп не дал результата — пробуем полный decode canvas
+          // (код у края кадра, кандидат ложный или смещённый)
+          if (!hit) hit = await tryDecodeCanvas(reader, dc);
+          coldTicks = 0;
 
-          // Шаг 3: препроцессинг
+        } else if (codeWasRecent) {
+          // ── Код был виден <800ms, L не найден: поворот / размытие ───────
+          hit = await tryDecodeCanvas(reader, dc);
           if (!hit) {
-            const ctx  = dc.getContext('2d')!;
-            const img  = ctx.getImageData(0, 0, dw, dh);
-            const gray = makeGray(img.data);
-
-            const d1 = new Uint8ClampedArray(img.data);
+            // Контраст-стретч
+            const d1 = new Uint8ClampedArray(imgData.data);
             stretchContrast(d1, gray);
             hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
-
-            if (!hit) {
-              const d2 = new Uint8ClampedArray(d1);
-              for (let i = 0; i < d2.length; i += 4) {
-                d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
-              }
-              hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
-            }
-
-            if (!hit) {
-              const d3 = new Uint8ClampedArray(img.data);
-              sharpenGray(gray, dw, dh, d3);
-              hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
-            }
           }
-
-          // Шаг 4: масштаб 1.5× центра
           if (!hit) {
-            const sm  = 0.20;
-            const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
-            const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
-            if (scw > 20 && sch > 20) {
-              hit = await tryDecodeCanvas(
-                reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
-              );
+            // Инверсия (тёмный фон)
+            const d2 = new Uint8ClampedArray(imgData.data);
+            stretchContrast(d2, gray);
+            for (let i = 0; i < d2.length; i += 4) {
+              d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
             }
+            hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
+          }
+          if (!hit) {
+            // Резкость
+            const d3 = new Uint8ClampedArray(imgData.data);
+            sharpenGray(gray, dw, dh, d3);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
+          }
+          coldTicks = 0;
+
+        } else {
+          // ── Нет L, код давно не виден: быстрый тик без ZXing (~2ms) ────
+          coldTicks++;
+          if (coldTicks % COLD_FALLBACK_TICKS === 0) {
+            // Страховка: полный ZXing раз в ~210ms
+            // Ловит повёрнутые / нестандартные коды при первом появлении
+            hit = await tryDecodeCanvas(reader, dc);
           }
         }
 
@@ -392,6 +474,7 @@ export default function Scanner() {
           }
         } else {
           nullStreak = 0;
+          coldTicks  = 0;
           handleDecoded(hit, dc);
         }
       } finally {
