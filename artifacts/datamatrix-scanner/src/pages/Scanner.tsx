@@ -317,13 +317,17 @@ export default function Scanner() {
       decodingRef.current = true;
       try {
         const { width: dw, height: dh } = dc;
-        const codeWasRecent = Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS;
         let hit: DecodeHit | null = null;
 
-        // Шаг 1: полный decode canvas
+        // Шаг 1: полный decode canvas (всегда)
         hit = await tryDecodeCanvas(reader, dc);
 
-        if (!hit && codeWasRecent) {
+        // Шаги 2-4: всегда, независимо от того, был ли код виден раньше.
+        // На 640×360 весь pipeline = 20-50ms — дёшево.
+        // При первом появлении кода в кадре эти шаги критически важны:
+        // без них ZXing без препроцессинга пропускает плохо освещённые коды.
+
+        if (!hit) {
           // Шаг 2: центр 70%
           const m  = 0.15;
           const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
@@ -331,45 +335,45 @@ export default function Scanner() {
           if (cw > 20 && ch > 20) {
             hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
           }
+        }
 
-          // Шаг 3: препроцессинг (маленький canvas = быстро)
+        if (!hit) {
+          // Шаг 3: препроцессинг
+          const ctx  = dc.getContext('2d')!;
+          const img  = ctx.getImageData(0, 0, dw, dh);
+          const gray = makeGray(img.data);
+
+          // 3a: контраст-стретч
+          const d1 = new Uint8ClampedArray(img.data);
+          stretchContrast(d1, gray);
+          hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
+
+          // 3b: инверсия
           if (!hit) {
-            const ctx  = dc.getContext('2d')!;
-            const img  = ctx.getImageData(0, 0, dw, dh);
-            const gray = makeGray(img.data);
-
-            // 3a: контраст-стретч
-            const d1 = new Uint8ClampedArray(img.data);
-            stretchContrast(d1, gray);
-            hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
-
-            // 3b: инверсия (светлые модули на тёмном фоне)
-            if (!hit) {
-              const d2 = new Uint8ClampedArray(d1);
-              for (let i = 0; i < d2.length; i += 4) {
-                d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
-              }
-              hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
+            const d2 = new Uint8ClampedArray(d1);
+            for (let i = 0; i < d2.length; i += 4) {
+              d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
             }
-
-            // 3c: резкость
-            if (!hit) {
-              const d3 = new Uint8ClampedArray(img.data);
-              sharpenGray(gray, dw, dh, d3);
-              hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
-            }
+            hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
           }
 
-          // Шаг 4: масштаб 1.5× центра (мелкий символ)
+          // 3c: резкость
           if (!hit) {
-            const sm  = 0.20;
-            const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
-            const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
-            if (scw > 20 && sch > 20) {
-              hit = await tryDecodeCanvas(
-                reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
-              );
-            }
+            const d3 = new Uint8ClampedArray(img.data);
+            sharpenGray(gray, dw, dh, d3);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
+          }
+        }
+
+        if (!hit) {
+          // Шаг 4: масштаб 1.5× центра (мелкий символ)
+          const sm  = 0.20;
+          const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
+          const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
+          if (scw > 20 && sch > 20) {
+            hit = await tryDecodeCanvas(
+              reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
+            );
           }
         }
 
