@@ -15,10 +15,10 @@ export interface ScanRecord {
 }
 
 // ── Константы ─────────────────────────────────────────────────────────────────
-const DECODE_INTERVAL_MS  = 50;    // мс между попытками декодирования
-const SCAN_LOCK_MS        = 1500;  // блокировка повтора одного кода
-const HARD_SEARCH_AFTER_MS = 400;  // делать доп. шаги только если код был <400мс назад
-const NULL_STREAK_RESET   = 2;     // сколько null подряд = «код ушёл из кадра»
+const DECODE_INTERVAL_MS  = 30;    // мс между попытками декодирования
+const SCAN_LOCK_MS        = 1500;  // блокировка повтора одного и того же кода
+const HARD_SEARCH_AFTER_MS = 800;  // делать шаги 2-4 если код был виден < 800мс назад
+const NULL_STREAK_RESET   = 1;     // 1 null подряд = «код ушёл из кадра» → lock снят
 const PHOTO_TTL_MS        = 8000;  // фото авто-удаляется через 8 сек
 
 // Размер canvas для ZXing-детекции.
@@ -319,61 +319,67 @@ export default function Scanner() {
         const { width: dw, height: dh } = dc;
         let hit: DecodeHit | null = null;
 
-        // Шаг 1: полный decode canvas (всегда)
+        // Шаг 1: полный decode canvas — ВСЕГДА.
+        // ZXing "fail fast" на 640×360 ≈ 20-40ms → дёшево даже когда кода нет.
         hit = await tryDecodeCanvas(reader, dc);
 
-        // Шаги 2-4: всегда, независимо от того, был ли код виден раньше.
-        // На 640×360 весь pipeline = 20-50ms — дёшево.
-        // При первом появлении кода в кадре эти шаги критически важны:
-        // без них ZXing без препроцессинга пропускает плохо освещённые коды.
+        // Шаги 2-4: только если код был виден < HARD_SEARCH_AFTER_MS назад.
+        //
+        // Зачем ограничение? ZXing с TRY_HARDER на "пустом" кадре занимает
+        // 100-400ms. При 4 шагах это 400ms-1.6s за тик. Null-streak никогда
+        // не успевает накопиться → lock не снимается → следующий код не ловится.
+        //
+        // Когда ограничение безопасно? После первой детекции любого кода ZXing
+        // уже знает, что "что-то есть" в кадре, и шаги 2-4 помогают при
+        // плохом освещении/расфокусе. Для совсем нового кода Step 1 справляется
+        // сам — он находит любой читаемый код за 1 тик (≤ 40ms).
+        if (!hit && Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS) {
 
-        if (!hit) {
           // Шаг 2: центр 70%
-          const m  = 0.15;
-          const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
-          const cw = Math.floor(dw * (1-2*m)), ch = Math.floor(dh * (1-2*m));
-          if (cw > 20 && ch > 20) {
-            hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
-          }
-        }
-
-        if (!hit) {
-          // Шаг 3: препроцессинг
-          const ctx  = dc.getContext('2d')!;
-          const img  = ctx.getImageData(0, 0, dw, dh);
-          const gray = makeGray(img.data);
-
-          // 3a: контраст-стретч
-          const d1 = new Uint8ClampedArray(img.data);
-          stretchContrast(d1, gray);
-          hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
-
-          // 3b: инверсия
           if (!hit) {
-            const d2 = new Uint8ClampedArray(d1);
-            for (let i = 0; i < d2.length; i += 4) {
-              d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
+            const m  = 0.15;
+            const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
+            const cw = Math.floor(dw * (1-2*m)), ch = Math.floor(dh * (1-2*m));
+            if (cw > 20 && ch > 20) {
+              hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
             }
-            hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
           }
 
-          // 3c: резкость
+          // Шаг 3: препроцессинг
           if (!hit) {
-            const d3 = new Uint8ClampedArray(img.data);
-            sharpenGray(gray, dw, dh, d3);
-            hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
-          }
-        }
+            const ctx  = dc.getContext('2d')!;
+            const img  = ctx.getImageData(0, 0, dw, dh);
+            const gray = makeGray(img.data);
 
-        if (!hit) {
-          // Шаг 4: масштаб 1.5× центра (мелкий символ)
-          const sm  = 0.20;
-          const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
-          const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
-          if (scw > 20 && sch > 20) {
-            hit = await tryDecodeCanvas(
-              reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
-            );
+            const d1 = new Uint8ClampedArray(img.data);
+            stretchContrast(d1, gray);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
+
+            if (!hit) {
+              const d2 = new Uint8ClampedArray(d1);
+              for (let i = 0; i < d2.length; i += 4) {
+                d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
+              }
+              hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
+            }
+
+            if (!hit) {
+              const d3 = new Uint8ClampedArray(img.data);
+              sharpenGray(gray, dw, dh, d3);
+              hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
+            }
+          }
+
+          // Шаг 4: масштаб 1.5× центра
+          if (!hit) {
+            const sm  = 0.20;
+            const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
+            const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
+            if (scw > 20 && sch > 20) {
+              hit = await tryDecodeCanvas(
+                reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
+              );
+            }
           }
         }
 
