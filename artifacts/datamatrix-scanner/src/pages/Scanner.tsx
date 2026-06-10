@@ -15,12 +15,16 @@ export interface ScanRecord {
 }
 
 // ── Константы ─────────────────────────────────────────────────────────────────
-const DECODE_INTERVAL_MS   = 50;   // Интервал опроса (мс) — чаще = быстрее реакция
-const SCAN_LOCK_MS          = 1500; // Блокировка повтора одного кода
-const STEP1_TIMEOUT_MS      = 100;  // Бюджет времени на шаг 1 (полный кадр)
-const STEP_EXTRA_TIMEOUT_MS = 80;   // Бюджет на шаги 2-4 (препроцессинг)
-const HARD_SEARCH_AFTER_MS  = 400;  // Делать тяжёлый поиск только если код был <400мс назад
-const PHOTO_TTL_MS          = 8000; // Фото авто-удаляется через 8 сек
+const DECODE_INTERVAL_MS  = 50;    // мс между попытками декодирования
+const SCAN_LOCK_MS        = 1500;  // блокировка повтора одного кода
+const HARD_SEARCH_AFTER_MS = 400;  // делать доп. шаги только если код был <400мс назад
+const NULL_STREAK_RESET   = 2;     // сколько null подряд = «код ушёл из кадра»
+const PHOTO_TTL_MS        = 8000;  // фото авто-удаляется через 8 сек
+
+// Размер canvas для ZXing-детекции.
+// В 9 раз меньше пикселей (vs 1080p) → ZXing в 9 раз быстрее.
+// Для качественного анализа по-прежнему используется полный кадр.
+const DECODE_W = 640;
 
 // ── Определение GoPro ─────────────────────────────────────────────────────────
 function isGoPro(label: string): boolean {
@@ -90,26 +94,20 @@ interface DecodeHit {
   offsetY: number;
 }
 
-/**
- * Декодирование canvas с жёстким таймаутом.
- * Promise.race гарантирует, что мы не ждём ZXing дольше `ms` мс,
- * даже если он ещё работает в фоне — интервал может стартовать следующую попытку.
- */
+// Простой вызов ZXing без искусственного таймаута.
+// ZXing на маленьком canvas (640×360) завершается за 20-100ms,
+// поэтому дополнительные ухищрения не нужны.
 async function tryDecodeCanvas(
   reader: BrowserDatamatrixCodeReader,
   canvas: HTMLCanvasElement,
   offsetX = 0,
   offsetY = 0,
-  ms = STEP1_TIMEOUT_MS,
 ): Promise<DecodeHit | null> {
   try {
-    const result = await Promise.race<any>([
-      (reader as any).decodeFromCanvas(canvas),
-      new Promise<null>(res => setTimeout(() => res(null), ms)),
-    ]);
-    if (result) return {
-      text:    result.getText() as string,
-      pts:     result.getResultPoints() as readonly ResultPoint[],
+    const r = await (reader as any).decodeFromCanvas(canvas);
+    if (r) return {
+      text:    r.getText() as string,
+      pts:     r.getResultPoints() as readonly ResultPoint[],
       offsetX,
       offsetY,
     };
@@ -119,10 +117,11 @@ async function tryDecodeCanvas(
 
 // ── Компонент ─────────────────────────────────────────────────────────────────
 export default function Scanner() {
-  const videoRef  = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const readerRef = useRef<BrowserDatamatrixCodeReader | null>(null);
+  const videoRef       = useRef<HTMLVideoElement>(null);
+  const canvasRef      = useRef<HTMLCanvasElement>(null);          // полный кадр (для анализа)
+  const decodeCanvasRef = useRef<HTMLCanvasElement | null>(null);  // маленький (для ZXing)
+  const streamRef      = useRef<MediaStream | null>(null);
+  const readerRef      = useRef<BrowserDatamatrixCodeReader | null>(null);
 
   // Циклы (как потоки Python)
   const runningRef     = useRef(false);
@@ -203,7 +202,10 @@ export default function Scanner() {
   }, []);
 
   // ── Обработка декодирования ────────────────────────────────────────────────
-  const handleDecoded = useCallback((hit: DecodeHit, frame: HTMLCanvasElement) => {
+  // decodeFrame — маленький canvas (640×360) из которого ZXing достал код.
+  // hit.pts / offsetX / offsetY — в координатах decodeFrame.
+  // Для анализа качества используется полный canvasRef (full-res).
+  const handleDecoded = useCallback((hit: DecodeHit, decodeFrame: HTMLCanvasElement) => {
     const now = Date.now();
     if (hit.text === lastDecoded.current && now - lastDecodedTime.current < SCAN_LOCK_MS) return;
 
@@ -211,27 +213,31 @@ export default function Scanner() {
     lastDecodedTime.current = now;
     setTimeout(() => { lastDecoded.current = ''; lastDecodedTime.current = 0; }, SCAN_LOCK_MS);
 
-    const roi    = computeRoi(frame, hit.pts, hit.offsetX, hit.offsetY);
-    const result = analyzeQuality(frame, hit.text, roi);
+    const fullCanvas = canvasRef.current!;
+
+    // ROI в координатах decode canvas → масштабируем в full-res
+    const roi = computeRoi(decodeFrame, hit.pts, hit.offsetX, hit.offsetY);
+    const sx = fullCanvas.width  / (decodeFrame.width  || 1);
+    const sy = fullCanvas.height / (decodeFrame.height || 1);
+    const fullRoi = {
+      x: Math.floor(roi.x * sx),
+      y: Math.floor(roi.y * sy),
+      w: Math.ceil(roi.w  * sx),
+      h: Math.ceil(roi.h  * sy),
+    };
+
+    const result = analyzeQuality(fullCanvas, hit.text, fullRoi);
     if (soundEnabledRef.current) playGradeSound(result.overallGrade);
 
-    // ── Захват фото текущего кадра ──────────────────────────────────────────
-    // Снимаем полный кадр (JPEG 85%) — это «мгновенная фотография» в момент
-    // обнаружения кода. Фото хранится PHOTO_TTL_MS мс, затем авто-удаляется.
+    // Фото — с полного кадра (не с маленького decode canvas)
     let photoUrl: string | undefined;
-    try {
-      photoUrl = frame.toDataURL('image/jpeg', 0.85);
-    } catch {
-      photoUrl = undefined;
-    }
+    try { photoUrl = fullCanvas.toDataURL('image/jpeg', 0.85); } catch {}
 
     const id = `${now}-${Math.random().toString(36).slice(2)}`;
-
     setCurrentResult(result);
     setCurrentPhoto(photoUrl ? { url: photoUrl, ts: now } : null);
     setHistory(prev => [{ id, result, photoUrl }, ...prev.slice(0, 49)]);
 
-    // Авто-удаление фото через PHOTO_TTL_MS
     if (photoUrl) {
       setTimeout(() => {
         setCurrentPhoto(prev => (prev?.ts === now ? null : prev));
@@ -241,15 +247,35 @@ export default function Scanner() {
   }, [computeRoi]);
 
   // ── Поток 1: захват кадров (requestAnimationFrame = _capture_loop) ─────────
+  // Каждый кадр рисуем в ДВА canvas:
+  //   canvasRef      — полный размер видео (для анализа качества и фото)
+  //   decodeCanvasRef — DECODE_W×* уменьшенная копия (для быстрого ZXing)
   const startCaptureLoop = useCallback(() => {
     const loop = () => {
       if (!runningRef.current) return;
       const video  = videoRef.current;
       const canvas = canvasRef.current;
       if (video && canvas && video.readyState >= 2) {
-        canvas.width  = video.videoWidth  || 640;
-        canvas.height = video.videoHeight || 480;
+        const vw = video.videoWidth  || 640;
+        const vh = video.videoHeight || 480;
+
+        // Полный кадр
+        canvas.width  = vw;
+        canvas.height = vh;
         canvas.getContext('2d')!.drawImage(video, 0, 0);
+
+        // Маленький decode canvas (масштаб сохраняет аспект)
+        if (!decodeCanvasRef.current) {
+          decodeCanvasRef.current = document.createElement('canvas');
+        }
+        const dc = decodeCanvasRef.current;
+        const dw = DECODE_W;
+        const dh = Math.round(vh * (DECODE_W / vw));
+        if (dc.width !== dw || dc.height !== dh) {
+          dc.width = dw; dc.height = dh;
+        }
+        dc.getContext('2d')!.drawImage(video, 0, 0, dw, dh);
+
         fpsCounter.current.frames++;
         const now = Date.now();
         if (now - fpsCounter.current.last >= 1000) {
@@ -262,105 +288,91 @@ export default function Scanner() {
     rafRef.current = requestAnimationFrame(loop);
   }, []);
 
-  // ── Поток 2: декодирование (setInterval = _decode_loop) ──────────────────
+  // ── Поток 2: декодирование ────────────────────────────────────────────────
   //
-  // Стратегия «мгновенного» обнаружения:
+  // Ключевая идея — ZXing работает на маленьком canvas (640×360):
+  //   • 640×360 = 230k пикселей vs 2M у 1080p → ZXing в ~9 раз быстрее
+  //   • На маленьком canvas "fail fast" = 20-80ms (vs 200-500ms на полном)
+  //   • Нет нужды в искусственных таймаутах / Promise.race
   //
-  //  • Интервал 50ms — частый опрос
-  //  • Каждый вызов ZXing ограничен таймаутом через Promise.race:
-  //      Шаг 1 (полный кадр) — до STEP1_TIMEOUT_MS (100ms)
-  //      Шаги 2-4            — до STEP_EXTRA_TIMEOUT_MS (80ms) каждый
-  //  • Адаптивный поиск:
-  //      – Если код виден или был виден < HARD_SEARCH_AFTER_MS назад →
-  //        полный pipeline (1→2→3→4), ZXing ищет изо всех сил
-  //      – Иначе → только шаг 1; если пусто — сразу следующий интервал
-  //        (экономим CPU, не делаем лишний препроцессинг)
-  //  • Мгновенный сброс scan-lock:
-  //      Если декодер вернул null И scan-lock активен — код ушёл из кадра.
-  //      Сбрасываем lock немедленно, чтобы следующий код принялся с первой
-  //      же попытки, не ожидая 1500ms таймера.
+  // Pipeline (все шаги — на decode canvas):
+  //   Шаг 1: полный decode canvas                             (всегда)
+  //   Шаг 2: центральная зона 70%                            (если код был недавно)
+  //   Шаг 3: контраст-стретч + инверсия + резкость           (если код был недавно)
+  //   Шаг 4: масштаб 1.5× центра (мелкий символ)             (если код был недавно)
+  //
+  // Мгновенный сброс scan-lock:
+  //   NULL_STREAK_RESET пропусков подряд → код ушёл → lock снимается немедленно.
   //
   const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
     if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
 
-    // Счётчик последовательных null-ов для защиты от случайных пропусков
     let nullStreak = 0;
-    const NULL_STREAK_RESET = 2; // сколько null подряд = «код ушёл»
 
     decodeTimerRef.current = setInterval(async () => {
       if (decodingRef.current || !runningRef.current) return;
-      const canvas = canvasRef.current;
-      if (!canvas || canvas.width === 0 || canvas.height === 0) return;
+      const dc = decodeCanvasRef.current;
+      if (!dc || dc.width === 0 || dc.height === 0) return;
 
       decodingRef.current = true;
       try {
-        const fw = canvas.width, fh = canvas.height;
+        const { width: dw, height: dh } = dc;
         const codeWasRecent = Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS;
         let hit: DecodeHit | null = null;
 
-        // ── Шаг 1: полный кадр, лимит STEP1_TIMEOUT_MS ──────────────────────
-        hit = await tryDecodeCanvas(reader, canvas, 0, 0, STEP1_TIMEOUT_MS);
+        // Шаг 1: полный decode canvas
+        hit = await tryDecodeCanvas(reader, dc);
 
-        // ── Шаги 2-4: только если код был недавно или lock активен ──────────
         if (!hit && codeWasRecent) {
-
-          // Шаг 2: центральная зона 70% (margin 15%)
+          // Шаг 2: центр 70%
           const m  = 0.15;
-          const cx = Math.floor(fw * m),       cy = Math.floor(fh * m);
-          const cw = Math.floor(fw * (1-2*m)), ch = Math.floor(fh * (1-2*m));
+          const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
+          const cw = Math.floor(dw * (1-2*m)), ch = Math.floor(dh * (1-2*m));
           if (cw > 20 && ch > 20) {
-            hit = await tryDecodeCanvas(
-              reader, cropCanvas(canvas, cx, cy, cw, ch), cx, cy, STEP_EXTRA_TIMEOUT_MS,
-            );
+            hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
           }
 
-          // Шаг 3: контраст-стретч
+          // Шаг 3: препроцессинг (маленький canvas = быстро)
           if (!hit) {
-            const ctx  = canvas.getContext('2d')!;
-            const img  = ctx.getImageData(0, 0, fw, fh);
+            const ctx  = dc.getContext('2d')!;
+            const img  = ctx.getImageData(0, 0, dw, dh);
             const gray = makeGray(img.data);
-            const d1   = new Uint8ClampedArray(img.data);
-            stretchContrast(d1, gray);
-            hit = await tryDecodeCanvas(reader, makeCanvas(d1, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
 
-            // Шаг 4a: инверсия (тёмный фон)
+            // 3a: контраст-стретч
+            const d1 = new Uint8ClampedArray(img.data);
+            stretchContrast(d1, gray);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
+
+            // 3b: инверсия (светлые модули на тёмном фоне)
             if (!hit) {
               const d2 = new Uint8ClampedArray(d1);
               for (let i = 0; i < d2.length; i += 4) {
                 d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
               }
-              hit = await tryDecodeCanvas(reader, makeCanvas(d2, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
+              hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
             }
 
-            // Шаг 4b: резкость
+            // 3c: резкость
             if (!hit) {
               const d3 = new Uint8ClampedArray(img.data);
-              sharpenGray(gray, fw, fh, d3);
-              hit = await tryDecodeCanvas(reader, makeCanvas(d3, fw, fh), 0, 0, STEP_EXTRA_TIMEOUT_MS);
+              sharpenGray(gray, dw, dh, d3);
+              hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
             }
+          }
 
-            // Шаг 4c: масштаб 1.5× центра (мелкий символ)
-            if (!hit) {
-              const sm  = 0.20;
-              const scx = Math.floor(fw * sm),        scy = Math.floor(fh * sm);
-              const scw = Math.floor(fw * (1-2*sm)),  sch = Math.floor(fh * (1-2*sm));
-              if (scw > 20 && sch > 20) {
-                hit = await tryDecodeCanvas(
-                  reader,
-                  scaleCanvas(cropCanvas(canvas, scx, scy, scw, sch), 1.5),
-                  scx, scy,
-                  STEP_EXTRA_TIMEOUT_MS,
-                );
-              }
+          // Шаг 4: масштаб 1.5× центра (мелкий символ)
+          if (!hit) {
+            const sm  = 0.20;
+            const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
+            const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
+            if (scw > 20 && sch > 20) {
+              hit = await tryDecodeCanvas(
+                reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
+              );
             }
           }
         }
 
-        // ── Мгновенный сброс scan-lock ────────────────────────────────────────
-        // Если ничего не нашли — считаем null подряд.
-        // После NULL_STREAK_RESET пропусков считаем, что код ушёл из кадра,
-        // и снимаем lock немедленно. Это позволяет тому же коду (или другому)
-        // сканироваться без ожидания 1500ms.
         if (!hit) {
           nullStreak++;
           if (nullStreak >= NULL_STREAK_RESET && lastDecoded.current !== '') {
@@ -370,7 +382,7 @@ export default function Scanner() {
           }
         } else {
           nullStreak = 0;
-          handleDecoded(hit, canvas);
+          handleDecoded(hit, dc);
         }
       } finally {
         decodingRef.current = false;
@@ -407,65 +419,44 @@ export default function Scanner() {
       let stream: MediaStream | null = null;
 
       // ── Стратегия подключения ────────────────────────────────────────────
-      // GoPro HERO 11 в режиме веб-камеры (USB) поддерживает:
-      //   • 1080p — это максимум (4K в USB-webcam режиме недоступна)
-      //   • FPS: минимум 30fps, часть устройств даёт 60fps и выше
-      //   Запрашиваем frameRate.ideal=120 — браузер/драйвер договорятся
-      //   о реальном максимуме (обычно 30 или 60fps).
-      // После подключения читаем getCapabilities() + getSettings() и
-      // пробуем поднять FPS через applyConstraints, если возможно.
-      //
-      // Обычная веб-камера: 1080p / ideal 60fps.
+      // GoPro HERO 11 USB webcam: 1080p макс., поддерживает 60fps.
+      // Запрашиваем ideal:60 min:30 — если 60 недоступно, получим 30.
+      // Обычная веб-камера: 1080p ideal:60.
+      // Три уровня fallback на случай ограниченного драйвера.
 
-      const primaryConstraints: MediaTrackConstraints = goPro ? {
+      const primaryConstraints: MediaTrackConstraints = {
         deviceId: { exact: selectedCamera },
         width:     { ideal: 1920, min: 1280 },
         height:    { ideal: 1080, min:  720 },
-        frameRate: { ideal:  120, min:    1 },  // brauser/driver negotiate real max
-      } : {
+        frameRate: { ideal:   60, min:   30 },
+      };
+
+      // GoPro часто не сообщает capabilities до открытия потока.
+      // Просто запрашиваем 60fps — браузер договорится с драйвером.
+      const fallback720: MediaTrackConstraints = {
         deviceId: { exact: selectedCamera },
-        width:     { ideal: 1920, min: 1280 },
-        height:    { ideal: 1080, min:  720 },
-        frameRate: { ideal:   60, min:    1 },
+        width:    { ideal: 1280 },
+        height:   { ideal:  720 },
+        frameRate:{ ideal:   60, min: 1 },
       };
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: primaryConstraints, audio: false });
       } catch {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { deviceId: { exact: selectedCamera }, width: { ideal: 1280 }, height: { ideal: 720 } },
-            audio: false,
-          });
+          stream = await navigator.mediaDevices.getUserMedia({ video: fallback720, audio: false });
         } catch {
           stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: selectedCamera }, audio: false });
         }
       }
 
-      // ── Пост-подключение: определяем реальные параметры GoPro ───────────
+      // Читаем реальные параметры после подключения (без попыток applyConstraints)
       if (goPro) {
-        const track    = stream.getVideoTracks()[0];
-        let   settings = track.getSettings();
-
-        // Пробуем использовать capabilities для запроса максимального FPS
-        try {
-          const caps   = track.getCapabilities?.() ?? {};
-          const maxFps = Math.floor((caps as any).frameRate?.max ?? 0);
-          const curFps = Math.floor(settings.frameRate ?? 0);
-
-          if (maxFps > curFps && maxFps > 1) {
-            // Устройство может больше — запросить явно
-            await track.applyConstraints({ frameRate: { ideal: maxFps } });
-            settings = track.getSettings(); // обновляем после apply
-          }
-        } catch {
-          // getCapabilities не поддерживается — оставляем как есть
-        }
-
+        const s = stream.getVideoTracks()[0].getSettings();
         setGoProInfo({
-          fps:    Math.round(settings.frameRate ?? 30),
-          width:  settings.width  ?? 1920,
-          height: settings.height ?? 1080,
+          fps:    Math.round(s.frameRate ?? 30),
+          width:  s.width  ?? 1920,
+          height: s.height ?? 1080,
         });
       } else {
         setGoProInfo(null);
