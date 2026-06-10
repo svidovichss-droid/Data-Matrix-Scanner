@@ -31,24 +31,50 @@ export default function HistoryLog({ history }: Props) {
   return (
     <div className="divide-y divide-border/30">
       {history.map((record) => {
-        const { result } = record;
+        const { result, photoUrl } = record;
         const grade = result.overallGrade;
 
         return (
           <div key={record.id} className="px-4 py-3 flex items-center gap-3 hover:bg-secondary/30 transition-colors">
-            <div
-              className="w-10 h-10 rounded-xl flex items-center justify-center font-black text-lg font-mono flex-shrink-0 border"
-              style={{
-                color: gradeColor(grade),
-                backgroundColor: gradeColor(grade) + '20',
-                borderColor: gradeColor(grade) + '50',
-              }}
-            >
-              {grade}
-            </div>
+
+            {/* Миниатюра фото (пока не удалено) или иконка грейда */}
+            {photoUrl ? (
+              <div
+                className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden border"
+                style={{ borderColor: gradeColor(grade) + '50' }}
+              >
+                <img
+                  src={photoUrl}
+                  alt={grade}
+                  className="w-full h-full object-cover"
+                />
+              </div>
+            ) : (
+              <div
+                className="w-10 h-10 rounded-xl flex items-center justify-center font-black text-lg font-mono flex-shrink-0 border"
+                style={{
+                  color: gradeColor(grade),
+                  backgroundColor: gradeColor(grade) + '20',
+                  borderColor: gradeColor(grade) + '50',
+                }}
+              >
+                {grade}
+              </div>
+            )}
 
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-mono text-foreground truncate">{result.decodedData}</p>
+              <div className="flex items-center gap-1.5">
+                {/* Грейд-бейдж (показываем всегда, особенно если фото заменяет иконку) */}
+                {photoUrl && (
+                  <span
+                    className="text-xs font-black font-mono"
+                    style={{ color: gradeColor(grade) }}
+                  >
+                    {grade}
+                  </span>
+                )}
+                <p className="text-xs font-mono text-foreground truncate">{result.decodedData}</p>
+              </div>
               <div className="flex items-center gap-2 mt-0.5">
                 <span className="text-xs text-muted-foreground">
                   {result.timestamp.toLocaleTimeString('ru')}

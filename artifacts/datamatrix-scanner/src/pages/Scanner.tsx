@@ -9,16 +9,18 @@ import HistoryLog from '@/components/HistoryLog';
 import ScannerOverlay from '@/components/ScannerOverlay';
 
 export interface ScanRecord {
-  id: string;
-  result: QualityResult;
+  id:       string;
+  result:   QualityResult;
+  photoUrl?: string; // Object-URL снимка; авто-удаляется через PHOTO_TTL_MS
 }
 
 // ── Константы ─────────────────────────────────────────────────────────────────
-const DECODE_INTERVAL_MS  = 50;    // Интервал опроса (мс) — чаще = быстрее реакция
-const SCAN_LOCK_MS         = 1500; // Блокировка повтора одного кода
-const STEP1_TIMEOUT_MS     = 100;  // Бюджет времени на шаг 1 (полный кадр)
-const STEP_EXTRA_TIMEOUT_MS = 80;  // Бюджет на шаги 2-4 (препроцессинг)
-const HARD_SEARCH_AFTER_MS  = 400; // Делать тяжёлый поиск только если код был &lt;400мс назад
+const DECODE_INTERVAL_MS   = 50;   // Интервал опроса (мс) — чаще = быстрее реакция
+const SCAN_LOCK_MS          = 1500; // Блокировка повтора одного кода
+const STEP1_TIMEOUT_MS      = 100;  // Бюджет времени на шаг 1 (полный кадр)
+const STEP_EXTRA_TIMEOUT_MS = 80;   // Бюджет на шаги 2-4 (препроцессинг)
+const HARD_SEARCH_AFTER_MS  = 400;  // Делать тяжёлый поиск только если код был <400мс назад
+const PHOTO_TTL_MS          = 8000; // Фото авто-удаляется через 8 сек
 
 // ── Определение GoPro ─────────────────────────────────────────────────────────
 function isGoPro(label: string): boolean {
@@ -147,6 +149,8 @@ export default function Scanner() {
   const [fps, setFps]                     = useState(0);
   // Реальные параметры подключённой GoPro (null = GoPro не используется)
   const [goProInfo, setGoProInfo]         = useState<{ fps: number; width: number; height: number } | null>(null);
+  // Последнее захваченное фото (data URL): хранится PHOTO_TTL_MS мс, затем удаляется
+  const [currentPhoto, setCurrentPhoto]  = useState<{ url: string; ts: number } | null>(null);
 
   const fpsCounter = useRef({ frames: 0, last: Date.now() });
 
@@ -210,11 +214,30 @@ export default function Scanner() {
     const roi    = computeRoi(frame, hit.pts, hit.offsetX, hit.offsetY);
     const result = analyzeQuality(frame, hit.text, roi);
     if (soundEnabledRef.current) playGradeSound(result.overallGrade);
+
+    // ── Захват фото текущего кадра ──────────────────────────────────────────
+    // Снимаем полный кадр (JPEG 85%) — это «мгновенная фотография» в момент
+    // обнаружения кода. Фото хранится PHOTO_TTL_MS мс, затем авто-удаляется.
+    let photoUrl: string | undefined;
+    try {
+      photoUrl = frame.toDataURL('image/jpeg', 0.85);
+    } catch {
+      photoUrl = undefined;
+    }
+
+    const id = `${now}-${Math.random().toString(36).slice(2)}`;
+
     setCurrentResult(result);
-    setHistory(prev => [
-      { id: `${now}-${Math.random().toString(36).slice(2)}`, result },
-      ...prev.slice(0, 49),
-    ]);
+    setCurrentPhoto(photoUrl ? { url: photoUrl, ts: now } : null);
+    setHistory(prev => [{ id, result, photoUrl }, ...prev.slice(0, 49)]);
+
+    // Авто-удаление фото через PHOTO_TTL_MS
+    if (photoUrl) {
+      setTimeout(() => {
+        setCurrentPhoto(prev => (prev?.ts === now ? null : prev));
+        setHistory(prev => prev.map(r => r.id === id ? { ...r, photoUrl: undefined } : r));
+      }, PHOTO_TTL_MS);
+    }
   }, [computeRoi]);
 
   // ── Поток 1: захват кадров (requestAnimationFrame = _capture_loop) ─────────
@@ -595,6 +618,28 @@ export default function Scanner() {
               <div className="p-4 space-y-4">
                 {currentResult ? (
                   <div className="result-enter space-y-4">
+
+                    {/* ── Фото снимка с countdown-баром ── */}
+                    {currentPhoto && (
+                      <div className="relative rounded-lg overflow-hidden border border-border/40">
+                        <img
+                          src={currentPhoto.url}
+                          alt="Снимок DataMatrix"
+                          className="w-full object-contain max-h-48 bg-black"
+                        />
+                        {/* Полупрозрачный оверлей "авто-удаление" */}
+                        <div className="absolute top-1.5 right-1.5 bg-black/70 text-white/70 text-[10px] px-1.5 py-0.5 rounded">
+                          авто-удаление
+                        </div>
+                        {/* Countdown: линия снизу съёживается слева направо */}
+                        <div
+                          key={currentPhoto.ts}
+                          className="absolute bottom-0 left-0 w-full h-[3px] bg-primary photo-ttl-bar"
+                          style={{ '--photo-ttl': `${PHOTO_TTL_MS}ms` } as React.CSSProperties}
+                        />
+                      </div>
+                    )}
+
                     <GradeDisplay result={currentResult} />
                     <ParameterTable parameters={currentResult.parameters} />
                     <div className="bg-secondary/50 rounded-lg p-3">

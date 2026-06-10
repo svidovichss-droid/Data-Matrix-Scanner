@@ -128,6 +128,16 @@
     to { opacity: 1; transform: translateY(0) scale(1); }
   }
 
+  /* Countdown bar: shrinks from full width to zero over --photo-ttl duration */
+  @keyframes photo-ttl {
+    from { transform: scaleX(1); }
+    to   { transform: scaleX(0); }
+  }
+  .photo-ttl-bar {
+    transform-origin: left center;
+    animation: photo-ttl var(--photo-ttl, 8s) linear forwards;
+  }
+
   .crosshair-corner {
     position: absolute;
     width: 24px;
