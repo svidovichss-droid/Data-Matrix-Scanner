@@ -145,7 +145,8 @@ export default function Scanner() {
   const [soundEnabled, setSoundEnabled]   = useState(true);
   const [activeTab, setActiveTab]         = useState<'scan' | 'history'>('scan');
   const [fps, setFps]                     = useState(0);
-  const [goProActive, setGoProActive]     = useState(false);
+  // Реальные параметры подключённой GoPro (null = GoPro не используется)
+  const [goProInfo, setGoProInfo]         = useState<{ fps: number; width: number; height: number } | null>(null);
 
   const fpsCounter = useRef({ frames: 0, last: Date.now() });
 
@@ -368,7 +369,7 @@ export default function Scanner() {
     if (videoRef.current) videoRef.current.srcObject = null;
     setScanning(false);
     setFps(0);
-    setGoProActive(false);
+    setGoProInfo(null);
   }, [stopAllLoops]);
 
   // ── Запуск сканирования ────────────────────────────────────────────────────
@@ -378,26 +379,35 @@ export default function Scanner() {
     stopAllLoops();
 
     try {
-      const label     = cameraLabels[selectedCamera] ?? '';
-      const goPro     = isGoPro(label);
+      const label  = cameraLabels[selectedCamera] ?? '';
+      const goPro  = isGoPro(label);
       let stream: MediaStream | null = null;
 
-      // Ограничения под камеру:
-      // GoPro11 поддерживает до 4K/60fps; обычная вебкамера — 1080p/60fps
-      const highResConstraints: MediaTrackConstraints = goPro ? {
+      // ── Стратегия подключения ────────────────────────────────────────────
+      // GoPro HERO 11 в режиме веб-камеры (USB) поддерживает:
+      //   • 1080p — это максимум (4K в USB-webcam режиме недоступна)
+      //   • FPS: минимум 30fps, часть устройств даёт 60fps и выше
+      //   Запрашиваем frameRate.ideal=120 — браузер/драйвер договорятся
+      //   о реальном максимуме (обычно 30 или 60fps).
+      // После подключения читаем getCapabilities() + getSettings() и
+      // пробуем поднять FPS через applyConstraints, если возможно.
+      //
+      // Обычная веб-камера: 1080p / ideal 60fps.
+
+      const primaryConstraints: MediaTrackConstraints = goPro ? {
         deviceId: { exact: selectedCamera },
-        width:     { ideal: 3840, min: 1280 },
-        height:    { ideal: 2160, min: 720  },
-        frameRate: { ideal: 60,   min: 30   },
+        width:     { ideal: 1920, min: 1280 },
+        height:    { ideal: 1080, min:  720 },
+        frameRate: { ideal:  120, min:    1 },  // brauser/driver negotiate real max
       } : {
         deviceId: { exact: selectedCamera },
         width:     { ideal: 1920, min: 1280 },
-        height:    { ideal: 1080, min: 720  },
-        frameRate: { ideal: 60,   min: 30   },
+        height:    { ideal: 1080, min:  720 },
+        frameRate: { ideal:   60, min:    1 },
       };
 
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: highResConstraints, audio: false });
+        stream = await navigator.mediaDevices.getUserMedia({ video: primaryConstraints, audio: false });
       } catch {
         try {
           stream = await navigator.mediaDevices.getUserMedia({
@@ -407,6 +417,35 @@ export default function Scanner() {
         } catch {
           stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: selectedCamera }, audio: false });
         }
+      }
+
+      // ── Пост-подключение: определяем реальные параметры GoPro ───────────
+      if (goPro) {
+        const track    = stream.getVideoTracks()[0];
+        let   settings = track.getSettings();
+
+        // Пробуем использовать capabilities для запроса максимального FPS
+        try {
+          const caps   = track.getCapabilities?.() ?? {};
+          const maxFps = Math.floor((caps as any).frameRate?.max ?? 0);
+          const curFps = Math.floor(settings.frameRate ?? 0);
+
+          if (maxFps > curFps && maxFps > 1) {
+            // Устройство может больше — запросить явно
+            await track.applyConstraints({ frameRate: { ideal: maxFps } });
+            settings = track.getSettings(); // обновляем после apply
+          }
+        } catch {
+          // getCapabilities не поддерживается — оставляем как есть
+        }
+
+        setGoProInfo({
+          fps:    Math.round(settings.frameRate ?? 30),
+          width:  settings.width  ?? 1920,
+          height: settings.height ?? 1080,
+        });
+      } else {
+        setGoProInfo(null);
       }
 
       streamRef.current = stream;
@@ -428,7 +467,6 @@ export default function Scanner() {
       startDecodeLoop(readerRef.current);
 
       setScanning(true);
-      setGoProActive(goPro);
     } catch (e: any) {
       setCameraError(`Ошибка запуска камеры: ${e?.message || e}`);
       setScanning(false);
@@ -458,8 +496,10 @@ export default function Scanner() {
         </div>
         <div className="flex items-center gap-3">
           <span className="text-xs text-muted-foreground hidden sm:block">Свидович А. · Петляков А.</span>
-          {goProActive && (
-            <span className="text-xs font-semibold bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded">GoPro</span>
+          {goProInfo && (
+            <span className="text-xs font-semibold bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded">
+              GoPro {goProInfo.width}×{goProInfo.height}@{goProInfo.fps}fps
+            </span>
           )}
           {scanning && (
             <span className="text-xs text-primary font-mono bg-primary/10 px-2 py-0.5 rounded">{fps} fps</span>
