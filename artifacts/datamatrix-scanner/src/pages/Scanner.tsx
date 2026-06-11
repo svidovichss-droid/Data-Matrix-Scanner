@@ -8,23 +8,6 @@ import ParameterTable from '@/components/ParameterTable';
 import HistoryLog from '@/components/HistoryLog';
 import ScannerOverlay from '@/components/ScannerOverlay';
 
-// ── Нативный BarcodeDetector API (Chrome/Edge 83+) ───────────────────────────
-// Встроен в браузер, аппаратно-ускорен, работает напрямую с <video>.
-// Нет необходимости в npm-пакете — просто проверяем наличие в window.
-interface NativeDetectedBarcode {
-  rawValue:    string;
-  format:      string;
-  cornerPoints: ReadonlyArray<{ x: number; y: number }>;
-  boundingBox: DOMRectReadOnly;
-}
-interface NativeBarcodeDetector {
-  detect(src: HTMLVideoElement | HTMLCanvasElement): Promise<NativeDetectedBarcode[]>;
-}
-declare const BarcodeDetector: {
-  new(opts: { formats: string[] }): NativeBarcodeDetector;
-  getSupportedFormats(): Promise<string[]>;
-};
-
 export interface ScanRecord {
   id:       string;
   result:   QualityResult;
@@ -32,12 +15,11 @@ export interface ScanRecord {
 }
 
 // ── Константы ─────────────────────────────────────────────────────────────────
-const DECODE_INTERVAL_MS    = 30;   // мс между попытками декодирования
-const SCAN_LOCK_MS          = 1500; // блокировка повтора одного и того же кода
-const HARD_SEARCH_AFTER_MS  = 800;  // полный ZXing+препроц если код был <800мс назад
-const NULL_STREAK_RESET     = 1;    // 1 null = «код ушёл из кадра» → lock снят
-const COLD_FALLBACK_TICKS   = 7;    // страховочный ZXing раз в N «холодных» тиков
-const PHOTO_TTL_MS          = 8000; // фото авто-удаляется через 8 сек
+const DECODE_INTERVAL_MS  = 30;    // мс между попытками декодирования
+const SCAN_LOCK_MS        = 1500;  // блокировка повтора одного и того же кода
+const HARD_SEARCH_AFTER_MS = 800;  // делать шаги 2-4 если код был виден < 800мс назад
+const NULL_STREAK_RESET   = 1;     // 1 null подряд = «код ушёл из кадра» → lock снят
+const PHOTO_TTL_MS        = 8000;  // фото авто-удаляется через 8 сек
 
 // Размер canvas для ZXing-детекции.
 // В 9 раз меньше пикселей (vs 1080p) → ZXing в 9 раз быстрее.
@@ -96,104 +78,12 @@ function cropCanvas(src: HTMLCanvasElement, x: number, y: number, w: number, h: 
   return c;
 }
 
-// ── Порог Отсу ────────────────────────────────────────────────────────────────
-// Автоматически выбирает порог бинаризации. Работает за O(256 + N) ≈ ~1ms.
-function otsuThreshold(gray: Float32Array): number {
-  const hist = new Int32Array(256);
-  for (const v of gray) hist[v | 0]++;
-  const total = gray.length;
-  let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * hist[i];
-  let w0 = 0, sumB = 0, maxVar = 0, threshold = 128;
-  for (let t = 0; t < 255; t++) {
-    w0 += hist[t]; if (!w0) continue;
-    const w1 = total - w0; if (!w1) break;
-    sumB += t * hist[t];
-    const mu0 = sumB / w0;
-    const mu1 = (sum - sumB) / w1;
-    const variance = w0 * w1 * (mu0 - mu1) ** 2;
-    if (variance > maxVar) { maxVar = variance; threshold = t; }
-  }
-  return threshold;
-}
-
-// ── L-паттерн DataMatrix (все 4 ориентации) ──────────────────────────────────
-// DataMatrix всегда имеет две сплошные границы, образующие L.
-// При поворотах символа L принимает 4 формы:
-//
-//   0°   → угол BL (снизу-слева):   H→вправо  + V→вверх
-//   90°  → угол TL (сверху-слева):  H→вправо  + V→вниз
-//   180° → угол TR (сверху-справа): H→влево   + V→вниз
-//   270° → угол BR (снизу-справа):  H→влево   + V→вверх
-//
-// Алгоритм (~2-3ms):
-//   Для каждого тёмного пикселя измеряем пробеги во всех 4 направлениях,
-//   проверяем все 4 комбинации пар (R+U, R+D, L+D, L+U).
-//   Кроп вычисляется от угла в сторону символа через dx/dy.
-interface LCandidate {
-  x:    number; // x угла (пиксели decode-canvas)
-  y:    number; // y угла
-  size: number; // оценочный размер символа в пикселях
-  dx:   number; // +1 = символ правее угла, -1 = левее
-  dy:   number; // +1 = символ ниже угла,  -1 = выше
-}
-
-function findLCandidates(
-  gray:      Float32Array,
-  w:         number,
-  h:         number,
-  threshold: number,
-): LCandidate[] {
-  const candidates: LCandidate[] = [];
-  const minArm = Math.max(5, Math.floor(Math.min(w, h) * 0.025));
-  const maxArm = Math.floor(Math.min(w, h) * 0.72);
-  const STRIDE = 2;
-
-  // Вспомогательная функция: длина непрерывного тёмного пробега
-  const run = (x0: number, y0: number, dx: number, dy: number): number => {
-    let n = 1;
-    while (n < maxArm) {
-      const nx = x0 + n * dx, ny = y0 + n * dy;
-      if (nx < 0 || nx >= w || ny < 0 || ny >= h) break;
-      if (gray[ny * w + nx] > threshold) break;
-      n++;
-    }
-    return n;
-  };
-
-  const tryAdd = (x: number, y: number, a1: number, a2: number, dx: number, dy: number) => {
-    if (a1 < minArm || a1 > maxArm || a2 < minArm || a2 > maxArm) return;
-    if (Math.min(a1, a2) < Math.max(a1, a2) * 0.58) return;
-    const size = Math.round((a1 + a2) / 2 * 1.1);
-    const clusterR = Math.max(10, size * 0.35);
-    for (const c of candidates) {
-      if (Math.abs(c.x - x) < clusterR && Math.abs(c.y - y) < clusterR) return;
-    }
-    candidates.push({ x, y, size, dx, dy });
-  };
-
-  for (let y = 0; y < h; y += STRIDE) {
-    for (let x = 0; x < w; x += STRIDE) {
-      if (gray[y * w + x] > threshold) continue;
-
-      const R = run(x, y, +1,  0);
-      const L = run(x, y, -1,  0);
-      const U = run(x, y,  0, -1);
-      const D = run(x, y,  0, +1);
-
-      // BL (0°):   H→вправо + V→вверх   → символ правее и выше угла
-      tryAdd(x, y, R, U, +1, -1);
-      // TL (90°):  H→вправо + V→вниз    → символ правее и ниже угла
-      tryAdd(x, y, R, D, +1, +1);
-      // TR (180°): H→влево  + V→вниз    → символ левее и ниже угла
-      tryAdd(x, y, L, D, -1, +1);
-      // BR (270°): H→влево  + V→вверх   → символ левее и выше угла
-      tryAdd(x, y, L, U, -1, -1);
-
-      if (candidates.length >= 6) return candidates;
-    }
-  }
-  return candidates;
+function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
+  const w = Math.round(src.width * scale), h = Math.round(src.height * scale);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d')!.drawImage(src, 0, 0, w, h);
+  return c;
 }
 
 // ── Результат декодирования ───────────────────────────────────────────────────
@@ -232,8 +122,6 @@ export default function Scanner() {
   const decodeCanvasRef = useRef<HTMLCanvasElement | null>(null);  // маленький (для ZXing)
   const streamRef      = useRef<MediaStream | null>(null);
   const readerRef      = useRef<BrowserDatamatrixCodeReader | null>(null);
-  // Нативный BarcodeDetector (Chrome/Edge 83+); null = не поддерживается
-  const nativeBDRef    = useRef<NativeBarcodeDetector | null>(null);
 
   // Циклы (как потоки Python)
   const runningRef     = useRef(false);
@@ -258,8 +146,6 @@ export default function Scanner() {
   const [soundEnabled, setSoundEnabled]   = useState(true);
   const [activeTab, setActiveTab]         = useState<'scan' | 'history'>('scan');
   const [fps, setFps]                     = useState(0);
-  // true = нативный BarcodeDetector активен (отображается в UI)
-  const [nativeDetector, setNativeDetector] = useState(false);
   // Реальные параметры подключённой GoPro (null = GoPro не используется)
   const [goProInfo, setGoProInfo]         = useState<{ fps: number; width: number; height: number } | null>(null);
   // Последнее захваченное фото (data URL): хранится PHOTO_TTL_MS мс, затем удаляется
@@ -269,17 +155,6 @@ export default function Scanner() {
 
   // Синхронизируем ref с состоянием
   useEffect(() => { soundEnabledRef.current = soundEnabled; }, [soundEnabled]);
-
-  // ── Инициализация нативного BarcodeDetector ────────────────────────────────
-  useEffect(() => {
-    if (typeof BarcodeDetector === 'undefined') return;
-    BarcodeDetector.getSupportedFormats().then(formats => {
-      if (formats.includes('data_matrix')) {
-        nativeBDRef.current = new BarcodeDetector({ formats: ['data_matrix'] });
-        setNativeDetector(true);
-      }
-    }).catch(() => { /* игнорируем — просто используем ZXing */ });
-  }, []);
 
   // ── Перечисление камер ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -371,66 +246,6 @@ export default function Scanner() {
     }
   }, [computeRoi]);
 
-  // ── Обработка результата нативного BarcodeDetector ────────────────────────
-  // BD возвращает cornerPoints в intrinsic-координатах видео.
-  // canvasRef всегда рисуется как drawImage(video, 0, 0) без масштаба,
-  // поэтому video.videoWidth == canvasRef.width → координаты совпадают напрямую.
-  const handleBarcodeDetected = useCallback((
-    text:   string,
-    pts:    ReadonlyArray<{ x: number; y: number }>,
-  ) => {
-    const now = Date.now();
-    if (text === lastDecoded.current && now - lastDecodedTime.current < SCAN_LOCK_MS) return;
-    lastDecoded.current     = text;
-    lastDecodedTime.current = now;
-    setTimeout(() => { lastDecoded.current = ''; lastDecodedTime.current = 0; }, SCAN_LOCK_MS);
-
-    const fullCanvas = canvasRef.current!;
-    const fw = fullCanvas.width, fh = fullCanvas.height;
-
-    // ROI из corner points в full-res пространстве
-    let roi: { x: number; y: number; w: number; h: number };
-    if (pts.length >= 2) {
-      const xs = Array.from(pts).map(p => p.x);
-      const ys = Array.from(pts).map(p => p.y);
-      const minX = Math.min(...xs), maxX = Math.max(...xs);
-      const minY = Math.min(...ys), maxY = Math.max(...ys);
-      const sw = maxX - minX, sh = maxY - minY;
-      if (sw > 4 && sh > 4) {
-        const margin = Math.max(sw, sh) * 0.25;
-        const rx = Math.max(0, Math.floor(minX - margin));
-        const ry = Math.max(0, Math.floor(minY - margin));
-        const rw = Math.min(fw - rx, Math.ceil(sw + 2 * margin));
-        const rh = Math.min(fh - ry, Math.ceil(sh + 2 * margin));
-        roi = { x: rx, y: ry, w: rw, h: rh };
-      } else {
-        const mx = Math.floor(fw * 0.25), my = Math.floor(fh * 0.25);
-        roi = { x: mx, y: my, w: fw - 2 * mx, h: fh - 2 * my };
-      }
-    } else {
-      const mx = Math.floor(fw * 0.25), my = Math.floor(fh * 0.25);
-      roi = { x: mx, y: my, w: fw - 2 * mx, h: fh - 2 * my };
-    }
-
-    const result = analyzeQuality(fullCanvas, text, roi);
-    if (soundEnabledRef.current) playGradeSound(result.overallGrade);
-
-    let photoUrl: string | undefined;
-    try { photoUrl = fullCanvas.toDataURL('image/jpeg', 0.85); } catch {}
-
-    const id = `${now}-${Math.random().toString(36).slice(2)}`;
-    setCurrentResult(result);
-    setCurrentPhoto(photoUrl ? { url: photoUrl, ts: now } : null);
-    setHistory(prev => [{ id, result, photoUrl }, ...prev.slice(0, 49)]);
-
-    if (photoUrl) {
-      setTimeout(() => {
-        setCurrentPhoto(prev => (prev?.ts === now ? null : prev));
-        setHistory(prev => prev.map(r => r.id === id ? { ...r, photoUrl: undefined } : r));
-      }, PHOTO_TTL_MS);
-    }
-  }, []);
-
   // ── Поток 1: захват кадров (requestAnimationFrame = _capture_loop) ─────────
   // Каждый кадр рисуем в ДВА canvas:
   //   canvasRef      — полный размер видео (для анализа качества и фото)
@@ -475,137 +290,115 @@ export default function Scanner() {
 
   // ── Поток 2: декодирование ────────────────────────────────────────────────
   //
-  //  Путь A — нативный BarcodeDetector (Chrome/Edge 83+):
-  //    detect(video) напрямую, ~5-15ms, аппаратно-ускорен, все углы поворота.
-  //    cornerPoints в intrinsic-координатах видео == full-res canvas.
+  // Ключевая идея — ZXing работает на маленьком canvas (640×360):
+  //   • 640×360 = 230k пикселей vs 2M у 1080p → ZXing в ~9 раз быстрее
+  //   • На маленьком canvas "fail fast" = 20-80ms (vs 200-500ms на полном)
+  //   • Нет нужды в искусственных таймаутах / Promise.race
   //
-  //  Путь B — ZXing + L-паттерн (Firefox, Safari, старые браузеры):
-  //    Otsu + findLCandidates × 4 ориентации (~2ms без ZXing),
-  //    ZXing только на кропе вокруг кандидата (~5-15ms на ~150px кропе),
-  //    fallback на полный decode canvas если кроп не взял.
-  //    codeWasRecent: полный ZXing + препроцессинг (размытие / уход кода).
-  //    Пустой тик без L: ~2ms, страховочный ZXing раз в COLD_FALLBACK_TICKS.
+  // Pipeline (все шаги — на decode canvas):
+  //   Шаг 1: полный decode canvas                             (всегда)
+  //   Шаг 2: центральная зона 70%                            (если код был недавно)
+  //   Шаг 3: контраст-стретч + инверсия + резкость           (если код был недавно)
+  //   Шаг 4: масштаб 1.5× центра (мелкий символ)             (если код был недавно)
+  //
+  // Мгновенный сброс scan-lock:
+  //   NULL_STREAK_RESET пропусков подряд → код ушёл → lock снимается немедленно.
   //
   const startDecodeLoop = useCallback((reader: BrowserDatamatrixCodeReader) => {
     if (decodeTimerRef.current) clearInterval(decodeTimerRef.current);
 
     let nullStreak = 0;
-    let coldTicks  = 0;
 
     decodeTimerRef.current = setInterval(async () => {
       if (decodingRef.current || !runningRef.current) return;
+      const dc = decodeCanvasRef.current;
+      if (!dc || dc.width === 0 || dc.height === 0) return;
+
       decodingRef.current = true;
-      let found = false;
       try {
+        const { width: dw, height: dh } = dc;
+        let hit: DecodeHit | null = null;
 
-        // ════════════════════════════════════════════════════════════════════
-        // ПУТЬ A: нативный BarcodeDetector
-        // ════════════════════════════════════════════════════════════════════
-        if (nativeBDRef.current) {
-          const video = videoRef.current;
-          if (!video || video.readyState < 2) return;
+        // Шаг 1: полный decode canvas — ВСЕГДА.
+        // ZXing "fail fast" на 640×360 ≈ 20-40ms → дёшево даже когда кода нет.
+        hit = await tryDecodeCanvas(reader, dc);
 
-          const barcodes = await nativeBDRef.current.detect(video);
-          if (barcodes.length > 0 && barcodes[0].rawValue) {
-            found = true;
-            coldTicks = 0;
-            handleBarcodeDetected(barcodes[0].rawValue, barcodes[0].cornerPoints);
+        // Шаги 2-4: только если код был виден < HARD_SEARCH_AFTER_MS назад.
+        //
+        // Зачем ограничение? ZXing с TRY_HARDER на "пустом" кадре занимает
+        // 100-400ms. При 4 шагах это 400ms-1.6s за тик. Null-streak никогда
+        // не успевает накопиться → lock не снимается → следующий код не ловится.
+        //
+        // Когда ограничение безопасно? После первой детекции любого кода ZXing
+        // уже знает, что "что-то есть" в кадре, и шаги 2-4 помогают при
+        // плохом освещении/расфокусе. Для совсем нового кода Step 1 справляется
+        // сам — он находит любой читаемый код за 1 тик (≤ 40ms).
+        if (!hit && Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS) {
+
+          // Шаг 2: центр 70%
+          if (!hit) {
+            const m  = 0.15;
+            const cx = Math.floor(dw * m),       cy = Math.floor(dh * m);
+            const cw = Math.floor(dw * (1-2*m)), ch = Math.floor(dh * (1-2*m));
+            if (cw > 20 && ch > 20) {
+              hit = await tryDecodeCanvas(reader, cropCanvas(dc, cx, cy, cw, ch), cx, cy);
+            }
           }
 
-        // ════════════════════════════════════════════════════════════════════
-        // ПУТЬ B: ZXing + L-паттерн (fallback для Firefox / Safari)
-        // ════════════════════════════════════════════════════════════════════
-        } else {
-          const dc = decodeCanvasRef.current;
-          if (!dc || dc.width === 0 || dc.height === 0) return;
-          const { width: dw, height: dh } = dc;
-          let hit: DecodeHit | null = null;
+          // Шаг 3: препроцессинг
+          if (!hit) {
+            const ctx  = dc.getContext('2d')!;
+            const img  = ctx.getImageData(0, 0, dw, dh);
+            const gray = makeGray(img.data);
 
-          // ── Шаг 0: grayscale + Otsu + L-паттерн (~2-3ms) ──────────────
-          const ctx     = dc.getContext('2d')!;
-          const imgData = ctx.getImageData(0, 0, dw, dh);
-          const gray    = makeGray(imgData.data);
-          const thr     = otsuThreshold(gray);
-          const lcands  = findLCandidates(gray, dw, dh, thr);
-          const codeWasRecent = Date.now() - lastDecodedTime.current < HARD_SEARCH_AFTER_MS;
+            const d1 = new Uint8ClampedArray(img.data);
+            stretchContrast(d1, gray);
+            hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
 
-          if (lcands.length > 0) {
-            // ── L найден: ZXing на кропе (~5-15ms) ──────────────────────
-            for (const { x, y, size, dx, dy } of lcands) {
-              // Центр символа = угол + (size/2 * dx, size/2 * dy)
-              const cx    = x + Math.floor(size / 2 * dx);
-              const cy    = y + Math.floor(size / 2 * dy);
-              const pad   = Math.floor(size * 0.4);
-              const half  = Math.floor(size / 2) + pad;
-              const cropX = Math.max(0,  cx - half);
-              const cropY = Math.max(0,  cy - half);
-              const cropW = Math.min(dw - cropX, half * 2);
-              const cropH = Math.min(dh - cropY, half * 2);
-              if (cropW < 12 || cropH < 12) continue;
-              hit = await tryDecodeCanvas(
-                reader, cropCanvas(dc, cropX, cropY, cropW, cropH), cropX, cropY,
-              );
-              if (hit) break;
-            }
-            // Кроп не взял — пробуем полный decode canvas
-            if (!hit) hit = await tryDecodeCanvas(reader, dc);
-            coldTicks = 0;
-
-          } else if (codeWasRecent) {
-            // ── Нет L, код был виден <800ms: поворот / размытие ─────────
-            hit = await tryDecodeCanvas(reader, dc);
             if (!hit) {
-              const d1 = new Uint8ClampedArray(imgData.data);
-              stretchContrast(d1, gray);
-              hit = await tryDecodeCanvas(reader, makeCanvas(d1, dw, dh));
-            }
-            if (!hit) {
-              const d2 = new Uint8ClampedArray(imgData.data);
-              stretchContrast(d2, gray);
+              const d2 = new Uint8ClampedArray(d1);
               for (let i = 0; i < d2.length; i += 4) {
                 d2[i] = 255 - d2[i]; d2[i+1] = 255 - d2[i+1]; d2[i+2] = 255 - d2[i+2];
               }
               hit = await tryDecodeCanvas(reader, makeCanvas(d2, dw, dh));
             }
+
             if (!hit) {
-              const d3 = new Uint8ClampedArray(imgData.data);
+              const d3 = new Uint8ClampedArray(img.data);
               sharpenGray(gray, dw, dh, d3);
               hit = await tryDecodeCanvas(reader, makeCanvas(d3, dw, dh));
             }
-            coldTicks = 0;
-
-          } else {
-            // ── Нет L, давно пусто: быстрый тик ~2ms ────────────────────
-            coldTicks++;
-            if (coldTicks % COLD_FALLBACK_TICKS === 0) {
-              // Страховка раз в ~210ms — ловит нестандартные случаи
-              hit = await tryDecodeCanvas(reader, dc);
-            }
           }
 
-          if (hit) {
-            found = true;
-            coldTicks = 0;
-            handleDecoded(hit, dc);
+          // Шаг 4: масштаб 1.5× центра
+          if (!hit) {
+            const sm  = 0.20;
+            const scx = Math.floor(dw * sm),        scy = Math.floor(dh * sm);
+            const scw = Math.floor(dw * (1-2*sm)),  sch = Math.floor(dh * (1-2*sm));
+            if (scw > 20 && sch > 20) {
+              hit = await tryDecodeCanvas(
+                reader, scaleCanvas(cropCanvas(dc, scx, scy, scw, sch), 1.5), scx, scy,
+              );
+            }
           }
         }
 
+        if (!hit) {
+          nullStreak++;
+          if (nullStreak >= NULL_STREAK_RESET && lastDecoded.current !== '') {
+            lastDecoded.current     = '';
+            lastDecodedTime.current = 0;
+            nullStreak = 0;
+          }
+        } else {
+          nullStreak = 0;
+          handleDecoded(hit, dc);
+        }
       } finally {
         decodingRef.current = false;
       }
-
-      if (!found) {
-        nullStreak++;
-        if (nullStreak >= NULL_STREAK_RESET && lastDecoded.current !== '') {
-          lastDecoded.current     = '';
-          lastDecodedTime.current = 0;
-          nullStreak = 0;
-        }
-      } else {
-        nullStreak = 0;
-      }
     }, DECODE_INTERVAL_MS);
-  }, [handleDecoded, handleBarcodeDetected]);
+  }, [handleDecoded]);
 
   // ── Остановка всех циклов ──────────────────────────────────────────────────
   const stopAllLoops = useCallback(() => {
@@ -726,15 +519,10 @@ export default function Scanner() {
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-xs text-muted-foreground hidden sm:block">Свидович А.</span>
+          <span className="text-xs text-muted-foreground hidden sm:block">Свидович А. · Петляков А.</span>
           {goProInfo && (
             <span className="text-xs font-semibold bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded">
               GoPro {goProInfo.width}×{goProInfo.height}@{goProInfo.fps}fps
-            </span>
-          )}
-          {nativeDetector && (
-            <span className="text-xs font-semibold bg-green-500/20 text-green-400 border border-green-500/30 px-2 py-0.5 rounded" title="Нативный BarcodeDetector API — мгновенное обнаружение">
-              ⚡ native
             </span>
           )}
           {scanning && (
@@ -885,7 +673,7 @@ export default function Scanner() {
 
       <footer className="border-t border-border/50 py-2 px-6 flex items-center justify-between text-xs text-muted-foreground/60">
         <span>ГОСТ Р 57302-2016 · ISO/IEC 15415:2011</span>
-        <span>Авторы: А. Свидович</span>
+        <span>Авторы: А. Свидович, А. Петляков</span>
       </footer>
     </div>
   );
